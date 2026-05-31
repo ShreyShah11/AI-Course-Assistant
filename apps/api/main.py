@@ -10,8 +10,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from apps.worker.core.config import load_environment
+
+load_environment("api")
+
+from routes.audio_chunking_jobs import router as audio_chunking_jobs_router
 from routes.document_chunking_jobs import router as document_chunking_jobs_router
 from routes.image_chunking_jobs import router as image_chunking_jobs_router
+from routes.qna_chunking_jobs import router as qna_chunking_jobs_router
 from routes.temp_chunk_preview import router as temp_chunk_preview_router
 
 try:
@@ -19,13 +24,12 @@ try:
 except ImportError:
     image_processing_router = None
 
-
-load_environment("api")
-
 app = FastAPI(title="AI Course Assistant API")
 
+app.include_router(audio_chunking_jobs_router)
 app.include_router(document_chunking_jobs_router)
 app.include_router(image_chunking_jobs_router)
+app.include_router(qna_chunking_jobs_router)
 # TEMPORARY: delete this include and the import above when chunk preview is removed.
 app.include_router(temp_chunk_preview_router)
 if image_processing_router is not None:

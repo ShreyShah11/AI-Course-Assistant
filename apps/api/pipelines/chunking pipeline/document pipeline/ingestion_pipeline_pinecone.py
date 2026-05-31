@@ -32,7 +32,7 @@ import json
 import os
 import re
 import sys
-import uuid
+import base64
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -44,6 +44,7 @@ for stream in (sys.stdout, sys.stderr):
 
 # ── LangChain ────────────────────────────────────────────────────
 from langchain_core.documents import Document
+from pydantic import BaseModel, Field
 
 # ── Gemini embeddings ────────────────────────────────────────────
 from google import genai
@@ -70,6 +71,10 @@ PINECONE_NAMESPACE  = os.getenv("PINECONE_NAMESPACE", "documents")
 
 EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2")
 EMBEDDING_DIM   = int(os.getenv("GEMINI_EMBEDDING_DIM", "1536"))
+IMAGE_SUMMARY_MODEL = os.getenv("GEMINI_IMAGE_SUMMARY_MODEL", "gemini-2.5-flash-lite")
+ENABLE_IMAGE_SUMMARIES = os.getenv("ENABLE_IMAGE_SUMMARIES", "true").lower() == "true"
+PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+IMAGE_SUMMARY_PROMPT_FILE = PROMPTS_DIR / "image_summary_few_shot.md"
 
 # PDF parsing strategy. hi_res is the default because it preserves richer
 # layout/table/image structure for downstream retrieval quality.
@@ -86,6 +91,19 @@ MIN_KEYWORD_LEN = 4     # ignore tokens shorter than this
 
 # Pinecone upsert batch size
 UPSERT_BATCH    = 100
+
+
+class ImageSummary(BaseModel):
+    """Structured summary for images extracted from source documents."""
+
+    image_type: str = Field(..., description="chart, diagram, table_image, photo, screenshot, formula, or other")
+    summary: str = Field(..., description="Concise description of the image content")
+    detected_text: str = Field("", description="Any readable text/OCR-like content visible in the image")
+    educational_value: str = Field(..., description="Why this image matters for learning or retrieval")
+    key_entities: List[str] = Field(default_factory=list, description="Important visible objects, labels, concepts, or entities")
+    relationships: List[str] = Field(default_factory=list, description="Important relationships, flows, comparisons, or trends")
+    searchable_keywords: List[str] = Field(default_factory=list, description="Short retrieval keywords for this image")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Model confidence in the summary")
 
 
 # ════════════════════════════════════════════════════════════════
@@ -145,6 +163,92 @@ def _chunk_id(source: str, chunk_index: int) -> str:
     """Stable, deterministic ID so re-ingesting the same file overwrites rather than duplicates."""
     raw = f"{Path(source).resolve()}::{chunk_index}"
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
+def _load_prompt(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def _get_metadata_value(el, *names: str):
+    metadata = getattr(el, "metadata", None)
+    if metadata is None:
+        return None
+
+    for name in names:
+        value = getattr(metadata, name, None)
+        if value:
+            return value
+
+    if hasattr(metadata, "to_dict"):
+        data = metadata.to_dict()
+        for name in names:
+            value = data.get(name)
+            if value:
+                return value
+
+    return None
+
+
+def _extract_image_payload(el) -> tuple[bytes, str] | None:
+    raw_payload = _get_metadata_value(
+        el,
+        "image_base64",
+        "image_base64_data",
+        "image_payload",
+    )
+    if not raw_payload:
+        return None
+
+    mime_type = _get_metadata_value(el, "image_mime_type", "mime_type") or "image/png"
+    payload = str(raw_payload)
+    if "," in payload and payload.lower().startswith("data:"):
+        header, payload = payload.split(",", 1)
+        if ";" in header:
+            mime_type = header[5:].split(";", 1)[0] or mime_type
+
+    try:
+        return base64.b64decode(payload), mime_type
+    except Exception:
+        return None
+
+
+def _summarize_image_with_gemini(image_bytes: bytes, mime_type: str) -> ImageSummary:
+    prompt = _load_prompt(IMAGE_SUMMARY_PROMPT_FILE)
+    client = _get_gemini_client()
+    response = client.models.generate_content(
+        model=IMAGE_SUMMARY_MODEL,
+        contents=[
+            prompt,
+            types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+        ],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=ImageSummary,
+            temperature=0.2,
+        ),
+    )
+
+    if getattr(response, "parsed", None) is not None:
+        return response.parsed
+
+    return ImageSummary.model_validate_json(response.text)
+
+
+def _image_summary_to_embedding_text(summary: ImageSummary) -> str:
+    parts = [
+        f"[IMAGE TYPE: {summary.image_type}]",
+        f"[IMAGE SUMMARY: {summary.summary}]",
+        f"[IMAGE EDUCATIONAL VALUE: {summary.educational_value}]",
+    ]
+    if summary.detected_text:
+        parts.append(f"[IMAGE DETECTED TEXT: {summary.detected_text}]")
+    if summary.key_entities:
+        parts.append("[IMAGE KEY ENTITIES: " + ", ".join(summary.key_entities) + "]")
+    if summary.relationships:
+        parts.append("[IMAGE RELATIONSHIPS: " + " | ".join(summary.relationships) + "]")
+    if summary.searchable_keywords:
+        parts.append("[IMAGE KEYWORDS: " + ", ".join(summary.searchable_keywords) + "]")
+    return "\n".join(parts)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -213,7 +317,11 @@ def create_chunks(elements: list) -> list:
 #  STEP 3 – BUILD RICH DOCUMENTS  (no AI, zero cost)
 # ════════════════════════════════════════════════════════════════
 
-def build_documents(chunks: list, source_file: str) -> List[Document]:
+def build_documents(
+    chunks: list,
+    source_file: str,
+    course_id: str = "",
+) -> List[Document]:
     """
     Convert unstructured chunks → LangChain Documents with maximum metadata.
 
@@ -254,6 +362,7 @@ def build_documents(chunks: list, source_file: str) -> List[Document]:
         section_title      = ""
         tables_html: List[str] = []
         tables_text: List[str] = []
+        image_summaries: List[ImageSummary] = []
         image_count        = 0
         list_item_count    = 0
         page_numbers: List[int] = []
@@ -275,9 +384,19 @@ def build_documents(chunks: list, source_file: str) -> List[Document]:
                 if plain:
                     tables_text.append(plain)
 
-            # Images – count only (skip base64 to stay under Pinecone 40 KB limit)
+            # Images – summarize extracted payloads; never store base64 in Pinecone.
             elif kind == "Image":
                 image_count += 1
+                if ENABLE_IMAGE_SUMMARIES:
+                    payload = _extract_image_payload(el)
+                    if payload:
+                        image_bytes, mime_type = payload
+                        try:
+                            image_summaries.append(
+                                _summarize_image_with_gemini(image_bytes, mime_type)
+                            )
+                        except Exception as exc:
+                            print(f"   ⚠️  Image summary failed: {exc}")
 
             # List items
             elif kind in {"ListItem", "List"}:
@@ -327,6 +446,8 @@ def build_documents(chunks: list, source_file: str) -> List[Document]:
         parts.append(raw_text)
         for tbl in tables_text:
             parts.append(f"[TABLE: {tbl}]")
+        for image_summary in image_summaries:
+            parts.append(_image_summary_to_embedding_text(image_summary))
         embedding_text = "\n\n".join(p for p in parts if p.strip())
 
         # ── 3g. Metadata dict ────────────────────────────────────
@@ -336,6 +457,7 @@ def build_documents(chunks: list, source_file: str) -> List[Document]:
             "source"          : str(path),
             "file_name"       : path.name,
             "file_type"       : file_ext,
+            "course_id"       : course_id,
 
             # Position
             "chunk_index"     : i,
@@ -354,6 +476,7 @@ def build_documents(chunks: list, source_file: str) -> List[Document]:
             "table_count"     : len(tables_html),
             "image_count"     : image_count,
             "list_item_count" : list_item_count,
+            "image_summary_count": len(image_summaries),
 
             # Statistics
             "char_count"      : char_count,
@@ -368,6 +491,10 @@ def build_documents(chunks: list, source_file: str) -> List[Document]:
             # Raw content (available at retrieval time)
             "raw_text"        : raw_text,
             "tables_text"     : " | ".join(tables_text),   # pipe-separated plain tables
+            "image_summaries"  : json.dumps(
+                [summary.model_dump() for summary in image_summaries],
+                ensure_ascii=False,
+            ),
 
             # Audit
             "ingested_at"     : datetime.now(timezone.utc).isoformat(),
@@ -413,24 +540,25 @@ def _embed_texts_with_gemini(
 
     return vectors
 
-def _get_or_create_index(pc: Pinecone) -> None:
+def _get_or_create_index(pc: Pinecone, index_name: str) -> None:
     existing = [idx.name for idx in pc.list_indexes()]
-    if PINECONE_INDEX_NAME not in existing:
-        print(f"\n🌲  Creating Pinecone index '{PINECONE_INDEX_NAME}' …")
+    if index_name not in existing:
+        print(f"\n🌲  Creating Pinecone index '{index_name}' …")
         pc.create_index(
-            name=PINECONE_INDEX_NAME,
+            name=index_name,
             dimension=EMBEDDING_DIM,
             metric="cosine",
             spec=ServerlessSpec(cloud=PINECONE_CLOUD, region=PINECONE_ENV),
         )
         print("   ✅  Index created")
     else:
-        print(f"\n🌲  Using existing index '{PINECONE_INDEX_NAME}'")
+        print(f"\n🌲  Using existing index '{index_name}'")
 
 
 def store_in_pinecone(
     documents: List[Document],
     namespace: str = PINECONE_NAMESPACE,
+    index_name: str = PINECONE_INDEX_NAME,
 ) -> None:
     """
     Embed documents with Gemini and upsert into Pinecone.
@@ -446,8 +574,8 @@ def store_in_pinecone(
     print("\n📌  Embedding & upserting to Pinecone …")
 
     pc = Pinecone(api_key=PINECONE_API_KEY)
-    _get_or_create_index(pc)
-    index = pc.Index(PINECONE_INDEX_NAME)
+    _get_or_create_index(pc, index_name=index_name)
+    index = pc.Index(index_name)
 
     texts = [doc.page_content for doc in documents]
     print(f"   Embedding {len(texts)} texts (this may take a moment) …")
@@ -464,6 +592,7 @@ def store_in_pinecone(
         # Pinecone 40 KB metadata cap: trim heavy fields
         m["raw_text"]     = m.get("raw_text", "")[:8_000]
         m["tables_text"]  = m.get("tables_text", "")[:4_000]
+        m["image_summaries"] = m.get("image_summaries", "")[:8_000]
         m["text_preview"] = m.get("text_preview", "")[:300]
 
         upsert_data.append({
@@ -490,6 +619,7 @@ def query_pinecone(
     query: str,
     top_k: int = 5,
     namespace: str = PINECONE_NAMESPACE,
+    index_name: str = PINECONE_INDEX_NAME,
     filter: Optional[dict] = None,
 ) -> List[dict]:
     """
@@ -504,7 +634,7 @@ def query_pinecone(
     Returns a list of result dicts with all metadata fields.
     """
     pc       = Pinecone(api_key=PINECONE_API_KEY)
-    index    = pc.Index(PINECONE_INDEX_NAME)
+    index    = pc.Index(index_name)
     query_vec = _embed_texts_with_gemini([query], task_type="RETRIEVAL_QUERY")[0]
 
     kwargs: dict = dict(
@@ -531,6 +661,8 @@ def query_pinecone(
 def run_pipeline(
     file_paths: List[str],
     namespace: Optional[str] = None,
+    index_name: str = PINECONE_INDEX_NAME,
+    course_id: str = "",
 ) -> None:
     """
     Ingest one or more files into Pinecone with rich metadata.
@@ -551,7 +683,7 @@ def run_pipeline(
         try:
             elements = partition_document(fp)
             chunks   = create_chunks(elements)
-            docs     = build_documents(chunks, source_file=fp)
+            docs     = build_documents(chunks, source_file=fp, course_id=course_id)
             all_docs.extend(docs)
         except Exception as exc:
             print(f"\n  ❌  Failed to process '{fp}': {exc}")
@@ -563,16 +695,16 @@ def run_pipeline(
         details = "; ".join(failures) if failures else "No chunks were produced."
         raise RuntimeError(f"Document ingestion produced no chunks. {details}")
 
-    store_in_pinecone(all_docs, namespace=ns)
+    store_in_pinecone(all_docs, namespace=ns, index_name=index_name)
 
     print("\n🎉  Pipeline complete!")
     print(f"   Vectors upserted : {len(all_docs)}")
-    print(f"   Pinecone index   : {PINECONE_INDEX_NAME}")
+    print(f"   Pinecone index   : {index_name}")
     print(f"   Namespace        : {ns}")
 
     return {
         "vectors_upserted": len(all_docs),
-        "pinecone_index": PINECONE_INDEX_NAME,
+        "pinecone_index": index_name,
         "namespace": ns,
         "failed_files": failures,
     }

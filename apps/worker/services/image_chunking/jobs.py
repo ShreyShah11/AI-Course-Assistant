@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from apps.worker.services.image_chunking.run_pipeline import run_pipeline
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 IMAGE_PIPELINE_DIR = (
@@ -68,15 +70,18 @@ def validate_file_path(file_path: str | Path) -> Path:
 
 def process_image_chunking_request(
     file_path: str,
+    course_id: str,
     dpi: int = 300,
+    course_name: str = "",
+    subject_area: str = "",
 ) -> dict[str, Any]:
     path = validate_file_path(file_path)
     worker = OCRWorker(debug=False)
-    pages = worker.process_file(path, dpi=dpi)
-    response = worker.to_response(pages)
-    response["source"] = {
-        "file_path": str(path),
-        "file_type": path.suffix.lower().lstrip("."),
-        "dpi": dpi,
-    }
-    return response
+    return run_pipeline(
+        file_path=path,
+        ocr_worker=worker,
+        dpi=dpi,
+        course_id=course_id,
+        course_name=course_name,
+        subject_area=subject_area,
+    )

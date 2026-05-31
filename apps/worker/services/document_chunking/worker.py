@@ -34,7 +34,7 @@ def get_service_queue() -> Queue:
 
 def enqueue_job(
     file_paths: list[str],
-    namespace: str | None = None,
+    course_id: str,
 ) -> Job:
     settings = get_queue_settings()
     queue = get_service_queue()
@@ -42,14 +42,14 @@ def enqueue_job(
         JOB_FUNCTION,
         kwargs={
             "file_paths": file_paths,
-            "namespace": namespace,
+            "course_id": course_id,
         },
         job_timeout=settings.timeout_seconds,
         result_ttl=settings.result_ttl_seconds,
         failure_ttl=settings.failure_ttl_seconds,
         meta={
             "file_paths": file_paths,
-            "namespace": namespace,
+            "course_id": course_id,
             "queue": queue.name,
         },
     )

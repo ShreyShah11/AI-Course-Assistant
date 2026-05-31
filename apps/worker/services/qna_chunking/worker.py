@@ -12,19 +12,19 @@ from apps.worker.core.redis import get_redis_url
 from apps.worker.core.rq import QueueSettings, env_int, get_queue
 
 
-QUEUE_NAME = os.getenv("IMAGE_CHUNKING_QUEUE", "image-chunking")
+QUEUE_NAME = os.getenv("QNA_CHUNKING_QUEUE", "qna-chunking")
 JOB_FUNCTION = (
-    "apps.worker.services.image_chunking.jobs."
-    "process_image_chunking_request"
+    "apps.worker.services.qna_chunking.jobs."
+    "process_qna_chunking_request"
 )
 
 
 def get_queue_settings() -> QueueSettings:
     return QueueSettings(
         name=QUEUE_NAME,
-        timeout_seconds=env_int("IMAGE_CHUNKING_JOB_TIMEOUT", 1800),
-        result_ttl_seconds=env_int("IMAGE_CHUNKING_RESULT_TTL", 86400),
-        failure_ttl_seconds=env_int("IMAGE_CHUNKING_FAILURE_TTL", 604800),
+        timeout_seconds=env_int("QNA_CHUNKING_JOB_TIMEOUT", 3600),
+        result_ttl_seconds=env_int("QNA_CHUNKING_RESULT_TTL", 86400),
+        failure_ttl_seconds=env_int("QNA_CHUNKING_FAILURE_TTL", 604800),
     )
 
 
@@ -33,34 +33,26 @@ def get_service_queue() -> Queue:
 
 
 def enqueue_job(
-    file_path: str,
+    file_paths: list[str],
     course_id: str,
-    dpi: int = 300,
-    course_name: str = "",
-    subject_area: str = "",
+    semantic_threshold: float = 0.45,
+    max_chunk_tokens: int = 800,
 ) -> Job:
     settings = get_queue_settings()
     queue = get_service_queue()
+    kwargs = {
+        "file_paths": file_paths,
+        "course_id": course_id,
+        "semantic_threshold": semantic_threshold,
+        "max_chunk_tokens": max_chunk_tokens,
+    }
     return queue.enqueue(
         JOB_FUNCTION,
-        kwargs={
-            "file_path": file_path,
-            "dpi": dpi,
-            "course_id": course_id,
-            "course_name": course_name,
-            "subject_area": subject_area,
-        },
+        kwargs=kwargs,
         job_timeout=settings.timeout_seconds,
         result_ttl=settings.result_ttl_seconds,
         failure_ttl=settings.failure_ttl_seconds,
-        meta={
-            "file_path": file_path,
-            "dpi": dpi,
-            "course_id": course_id,
-            "course_name": course_name,
-            "subject_area": subject_area,
-            "queue": queue.name,
-        },
+        meta={**kwargs, "queue": queue.name},
     )
 
 

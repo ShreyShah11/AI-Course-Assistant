@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from apps.worker.core.config import load_environment
-from apps.worker.core.pinecone import get_pinecone_settings
+from apps.worker.core.pinecone import get_course_index_name
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -75,20 +75,22 @@ def load_ingestion_pipeline_module():
 
 def run_pipeline(
     file_paths: list[str],
-    namespace: str | None = None,
+    course_id: str,
 ) -> dict[str, Any]:
     paths = validate_file_paths(file_paths)
-    settings = get_pinecone_settings()
+    target_index = get_course_index_name(course_id)
 
     if not os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
         raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is not configured.")
 
     pipeline = load_ingestion_pipeline_module()
-    target_namespace = namespace or settings.namespace
+    target_namespace = os.getenv("DOCUMENT_CHUNKING_NAMESPACE", "document-chunks")
 
     pipeline_result = pipeline.run_pipeline(
         file_paths=[str(path) for path in paths],
         namespace=target_namespace,
+        index_name=target_index,
+        course_id=course_id,
     ) or {}
 
     return {
@@ -96,6 +98,6 @@ def run_pipeline(
         "file_count": len(paths),
         "files": [str(path) for path in paths],
         "namespace": target_namespace,
-        "pinecone_index": settings.index_name,
+        "pinecone_index": pipeline_result.get("pinecone_index", target_index),
         "pipeline_result": pipeline_result,
     }

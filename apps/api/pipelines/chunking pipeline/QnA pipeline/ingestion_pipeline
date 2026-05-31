@@ -1,0 +1,604 @@
+"""
+QnA Document Chunking Pipeline
+================================
+Handles PDF, DOCX, PPTX → structured QnA chunks with rich metadata.
+
+Strategy:
+  1. Extract raw text + structural hints (headings, page numbers) per file type
+  2. Detect QnA patterns (regex + heuristic) to split into candidate QnA blocks
+  3. Semantic clustering: embed each block, group by cosine similarity so
+     topically related QnAs are colocated in the same semantic chunk
+  4. Emit JSON chunks with rich metadata for downstream quiz generation
+
+Chunk metadata schema:
+  - chunk_id          : unique hash
+  - source_file       : original filename
+  - file_type         : pdf | docx | pptx
+  - page_range        : [start, end]  (best-effort for pptx = slide numbers)
+  - chunk_type        : "single_qa" | "multi_qa" | "passage"
+  - topic_cluster     : int  (semantic cluster id)
+  - topic_label       : str  (auto-labelled from dominant terms)
+  - questions         : list[str]
+  - answers           : list[str]
+  - raw_text          : full chunk text
+  - char_count        : int
+  - token_estimate    : int  (rough: chars/4)
+  - difficulty_hint   : "easy"|"medium"|"hard"|"unknown"
+  - has_sub_parts     : bool  (a,b,c sub-questions detected)
+  - marks_hint        : int|None  (marks/points if mentioned in text)
+  - year_hint         : int|None  (exam year if detected)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import numpy as np
+from google import genai
+from google.genai import types
+
+# ── document parsers ────────────────────────────────────────────────────────
+
+def extract_pdf(path: str) -> List[Tuple[str, int]]:
+    """Returns list of (text, page_number) tuples."""
+    import fitz  # PyMuPDF
+    doc = fitz.open(path)
+    pages = []
+    for i, page in enumerate(doc, start=1):
+        text = page.get_text("text")
+        pages.append((text, i))
+    doc.close()
+    return pages
+
+
+def extract_docx(path: str) -> List[Tuple[str, int]]:
+    """Paragraphs grouped into pseudo-pages of ~50 paragraphs each."""
+    from docx import Document
+    doc = Document(path)
+    chunks, current, page = [], [], 1
+    for para in doc.paragraphs:
+        t = para.text.strip()
+        if t:
+            current.append(t)
+        if len(current) >= 50:
+            chunks.append(("\n".join(current), page))
+            page += 1
+            current = []
+    if current:
+        chunks.append(("\n".join(current), page))
+    return chunks if chunks else [("", 1)]
+
+
+def extract_pptx(path: str) -> List[Tuple[str, int]]:
+    """One 'page' per slide."""
+    from pptx import Presentation
+    prs = Presentation(path)
+    pages = []
+    for i, slide in enumerate(prs.slides, start=1):
+        texts = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for para in shape.text_frame.paragraphs:
+                    t = para.text.strip()
+                    if t:
+                        texts.append(t)
+        pages.append(("\n".join(texts), i))
+    return pages
+
+
+def extract_text_pages(path: str) -> List[Tuple[str, int]]:
+    """Route to the right extractor based on file extension."""
+    ext = Path(path).suffix.lower()
+    if ext == ".pdf":
+        return extract_pdf(path)
+    elif ext == ".docx":
+        return extract_docx(path)
+    elif ext in (".pptx", ".ppt"):
+        return extract_pptx(path)
+    else:
+        raise ValueError(f"Unsupported file type: {ext}")
+
+
+# ── QnA detection ────────────────────────────────────────────────────────────
+
+# Patterns that strongly indicate a question start
+Q_PATTERNS = [
+    # Numbered: "1.", "Q1.", "Q.1", "(1)", "1)"
+    re.compile(r"^(?:Q\.?\s*)?(\d+)[.)]\s+", re.MULTILINE | re.IGNORECASE),
+    # Roman numerals: "i.", "ii."
+    re.compile(r"^(?:Q\.?\s*)?(x{0,3}(?:ix|iv|v?i{0,3}))[.)]\s+", re.MULTILINE | re.IGNORECASE),
+    # Lettered: "a.", "b)" etc. for sub-parts
+    re.compile(r"^\s*\(?([a-z])\)?[.)]\s+", re.MULTILINE),
+    # Explicit "Question" / "Q:" keyword
+    re.compile(r"^(?:Question|Ques|Q)\s*[:\-–—]?\s*\d*\s*[:\-–—]?\s+", re.MULTILINE | re.IGNORECASE),
+    # "?" ending sentences
+]
+
+A_PATTERNS = [
+    re.compile(r"^(?:Answer|Ans|A)\s*[:\-–—]?\s*\d*\s*[:\-–—]?\s+", re.MULTILINE | re.IGNORECASE),
+    re.compile(r"^Solution\s*[:\-–—]\s+", re.MULTILINE | re.IGNORECASE),
+]
+
+YEAR_RE   = re.compile(r"\b(?:19|20)\d{2}\b")
+MARKS_RE  = re.compile(r"\[(\d+)\s*(?:marks?|pts?|points?)\]", re.IGNORECASE)
+DIFF_RE   = re.compile(r"\b(easy|medium|hard|difficult|simple|basic|advanced)\b", re.IGNORECASE)
+
+DIFF_MAP = {
+    "easy": "easy", "simple": "easy", "basic": "easy",
+    "medium": "medium",
+    "hard": "hard", "difficult": "hard", "advanced": "hard",
+}
+
+
+@dataclass
+class RawBlock:
+    text: str
+    page_start: int
+    page_end: int
+    questions: List[str] = field(default_factory=list)
+    answers: List[str] = field(default_factory=list)
+    has_sub_parts: bool = False
+    marks_hint: Optional[int] = None
+    year_hint: Optional[int] = None
+    difficulty_hint: str = "unknown"
+
+
+def _clean(text: str) -> str:
+    # Normalize whitespace, remove null bytes
+    text = text.replace("\x00", "")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def split_into_raw_blocks(pages: List[Tuple[str, int]]) -> List[RawBlock]:
+    """
+    Merge all page text, then split on QnA boundaries.
+    Each RawBlock contains either a detected Q/A pair or a passage.
+    """
+    # Merge pages, track page mapping by char offset
+    full_text = ""
+    offset_to_page: List[Tuple[int, int]] = []  # (start_char, page_no)
+    for (txt, pg) in pages:
+        offset_to_page.append((len(full_text), pg))
+        full_text += _clean(txt) + "\n\n"
+
+    def char_to_page(char_idx: int) -> int:
+        pg = 1
+        for (start, p) in offset_to_page:
+            if start <= char_idx:
+                pg = p
+        return pg
+
+    # Build a combined pattern that detects question starts
+    combined_q = re.compile(
+        r"(?m)^(?:"
+        r"(?:Q\.?\s*)?(?:\d+)[.)]\s"       # 1. / Q1. / (1)
+        r"|(?:Question|Ques|Q)\s*[:\-–—]?\s*\d*\s*[:\-–—]?\s"
+        r")",
+        re.IGNORECASE
+    )
+
+    # Find all question start positions
+    boundaries = [m.start() for m in combined_q.finditer(full_text)]
+
+    if not boundaries:
+        # Fallback: split on double newlines (paragraph mode)
+        paras = re.split(r"\n\s*\n", full_text)
+        blocks = []
+        char_ptr = 0
+        for p in paras:
+            p = p.strip()
+            if len(p) < 20:
+                char_ptr += len(p) + 2
+                continue
+            pg = char_to_page(char_ptr)
+            block = _parse_block(p, pg, pg)
+            if block:
+                blocks.append(block)
+            char_ptr += len(p) + 2
+        return blocks
+
+    # Add sentinel at end
+    boundaries.append(len(full_text))
+    blocks = []
+    for i in range(len(boundaries) - 1):
+        seg = full_text[boundaries[i]: boundaries[i + 1]].strip()
+        if len(seg) < 15:
+            continue
+        pg_start = char_to_page(boundaries[i])
+        pg_end   = char_to_page(boundaries[i + 1] - 1)
+        block = _parse_block(seg, pg_start, pg_end)
+        if block:
+            blocks.append(block)
+
+    return blocks
+
+
+def _parse_block(text: str, pg_start: int, pg_end: int) -> Optional[RawBlock]:
+    """Extract structured Q/A from a text segment."""
+    text = text.strip()
+    if not text:
+        return None
+
+    questions: List[str] = []
+    answers: List[str] = []
+
+    # Try to split on explicit Answer marker
+    ans_split = A_PATTERNS[0].search(text) or A_PATTERNS[1].search(text)
+    if ans_split:
+        q_part = text[: ans_split.start()].strip()
+        a_part = text[ans_split.end():].strip()
+        if q_part:
+            questions.append(q_part)
+        if a_part:
+            answers.append(a_part)
+    else:
+        # Treat whole block as question (answer not provided or inline)
+        questions.append(text)
+
+    # Sub-parts detection: look for a), b) c) patterns
+    has_sub = bool(re.search(r"^\s*\(?[a-d]\)?[.)]\s", text, re.MULTILINE))
+
+    # Marks
+    m = MARKS_RE.search(text)
+    marks = int(m.group(1)) if m else None
+
+    # Year
+    yr = YEAR_RE.findall(text)
+    year = int(yr[-1]) if yr else None
+
+    # Difficulty
+    d = DIFF_RE.search(text)
+    difficulty = DIFF_MAP.get(d.group(1).lower(), "unknown") if d else "unknown"
+
+    return RawBlock(
+        text=text,
+        page_start=pg_start,
+        page_end=pg_end,
+        questions=questions,
+        answers=answers,
+        has_sub_parts=has_sub,
+        marks_hint=marks,
+        year_hint=year,
+        difficulty_hint=difficulty,
+    )
+
+
+# ── semantic grouping ─────────────────────────────────────────────────────────
+
+def embed_blocks(blocks: List[RawBlock], model_name: Optional[str] = None) -> np.ndarray:
+    """
+    Embed each block's text. Returns (N, D) float32 array.
+
+    Uses Gemini embeddings so semantic clustering and Pinecone retrieval share
+    the same vector model and dimensionality.
+    """
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is not configured.")
+
+    model = model_name or os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2")
+    dimension = int(os.getenv("GEMINI_EMBEDDING_DIM", "1536"))
+    client = genai.Client(api_key=api_key)
+    embeddings = []
+
+    for block in blocks:
+        result = client.models.embed_content(
+            model=model,
+            contents=block.text if block.text.strip() else " ",
+            config=types.EmbedContentConfig(
+                task_type="CLUSTERING",
+                output_dimensionality=dimension,
+            ),
+        )
+        embeddings.append(result.embeddings[0].values)
+
+    return np.array(embeddings, dtype=np.float32)
+
+
+def semantic_cluster(
+    embeddings: np.ndarray,
+    threshold: float = 0.45,
+    min_cluster_size: int = 1,
+) -> List[int]:
+    """
+    Greedy sequential clustering: a new block joins the current cluster if
+    its cosine similarity to the cluster centroid is >= threshold,
+    otherwise it starts a new cluster.
+
+    This preserves document order (important for PYQ sets) while grouping
+    topically related items.
+    """
+    if len(embeddings) == 0:
+        return []
+
+    def cosine(a, b):
+        denom = (np.linalg.norm(a) * np.linalg.norm(b))
+        return float(np.dot(a, b) / denom) if denom > 1e-9 else 0.0
+
+    labels = [0]
+    centroids = [embeddings[0].copy()]
+    counts = [1]
+
+    for i in range(1, len(embeddings)):
+        # Compare against last N cluster centroids (locality window)
+        best_cluster = -1
+        best_sim = -1.0
+        for ci in range(max(0, len(centroids) - 5), len(centroids)):
+            sim = cosine(embeddings[i], centroids[ci])
+            if sim > best_sim:
+                best_sim = sim
+                best_cluster = ci
+
+        if best_sim >= threshold:
+            labels.append(best_cluster)
+            # Update centroid (running average)
+            n = counts[best_cluster]
+            centroids[best_cluster] = (centroids[best_cluster] * n + embeddings[i]) / (n + 1)
+            counts[best_cluster] += 1
+        else:
+            new_id = len(centroids)
+            labels.append(new_id)
+            centroids.append(embeddings[i].copy())
+            counts.append(1)
+
+    return labels
+
+
+def extract_topic_label(texts: List[str], max_words: int = 5) -> str:
+    """Simple TF-based keyword extraction for a topic label."""
+    from collections import Counter
+    STOPWORDS = {
+        "the","a","an","is","in","of","and","to","for","with","that","this",
+        "are","was","be","it","its","at","by","on","or","from","as","which",
+        "have","has","had","can","will","what","how","why","when","where","who",
+        "not","but","if","so","do","does","did","question","answer","explain",
+        "find","write","calculate","state","define","describe","list","give",
+        "following","marks","year","part",
+    }
+    words = re.findall(r"[a-zA-Z]{4,}", " ".join(texts).lower())
+    freq = Counter(w for w in words if w not in STOPWORDS)
+    top = [w for w, _ in freq.most_common(max_words)]
+    return " / ".join(top) if top else "general"
+
+
+# ── final chunk assembly ──────────────────────────────────────────────────────
+
+@dataclass
+class QnAChunk:
+    chunk_id: str
+    source_file: str
+    file_type: str
+    page_range: List[int]
+    chunk_type: str          # single_qa | multi_qa | passage
+    topic_cluster: int
+    topic_label: str
+    questions: List[str]
+    answers: List[str]
+    raw_text: str
+    char_count: int
+    token_estimate: int
+    difficulty_hint: str
+    has_sub_parts: bool
+    marks_hint: Optional[int]
+    year_hint: Optional[int]
+
+
+def _make_id(text: str, source: str, cluster: int) -> str:
+    payload = f"{source}:{cluster}:{text[:100]}"
+    return hashlib.md5(payload.encode()).hexdigest()[:12]
+
+
+def assemble_chunks(
+    blocks: List[RawBlock],
+    cluster_labels: List[int],
+    source_file: str,
+    file_type: str,
+    max_chunk_tokens: int = 800,
+) -> List[QnAChunk]:
+    """
+    Group blocks by cluster label into final chunks.
+    If a cluster is too large (> max_chunk_tokens), split it further.
+    """
+    from collections import defaultdict
+    cluster_map: dict = defaultdict(list)
+    for block, label in zip(blocks, cluster_labels):
+        cluster_map[label].append(block)
+
+    chunks: List[QnAChunk] = []
+
+    for cluster_id in sorted(cluster_map.keys()):
+        group = cluster_map[cluster_id]
+
+        # Determine topic label from all texts in this cluster
+        topic_lbl = extract_topic_label([b.text for b in group])
+
+        # Collect all Q/A, metadata
+        all_questions: List[str] = []
+        all_answers: List[str] = []
+        page_starts, page_ends = [], []
+        difficulties, marks_list, years_list = [], [], []
+        has_sub = False
+
+        for b in group:
+            all_questions.extend(b.questions)
+            all_answers.extend(b.answers)
+            page_starts.append(b.page_start)
+            page_ends.append(b.page_end)
+            if b.difficulty_hint != "unknown":
+                difficulties.append(b.difficulty_hint)
+            if b.marks_hint is not None:
+                marks_list.append(b.marks_hint)
+            if b.year_hint is not None:
+                years_list.append(b.year_hint)
+            if b.has_sub_parts:
+                has_sub = True
+
+        combined_text = "\n\n---\n\n".join(b.text for b in group)
+
+        # Determine chunk_type
+        n_qs = len(all_questions)
+        has_ans = len(all_answers) > 0
+        if n_qs == 1:
+            chunk_type = "single_qa" if has_ans else "passage"
+        else:
+            chunk_type = "multi_qa"
+
+        # Infer dominant difficulty
+        difficulty = max(set(difficulties), key=difficulties.count) if difficulties else "unknown"
+
+        # If combined text is too large → split into sub-chunks preserving cluster id
+        token_est = len(combined_text) // 4
+        if token_est > max_chunk_tokens and len(group) > 1:
+            # Recursively split: pair-wise grouping
+            mid = len(group) // 2
+            sub_groups = [group[:mid], group[mid:]]
+            for sg in sub_groups:
+                sub_text = "\n\n---\n\n".join(b.text for b in sg)
+                sub_qs = [q for b in sg for q in b.questions]
+                sub_as = [a for b in sg for a in b.answers]
+                sub_type = "single_qa" if len(sub_qs) == 1 else "multi_qa"
+                chunk = QnAChunk(
+                    chunk_id=_make_id(sub_text, source_file, cluster_id),
+                    source_file=source_file,
+                    file_type=file_type,
+                    page_range=[min(b.page_start for b in sg), max(b.page_end for b in sg)],
+                    chunk_type=sub_type,
+                    topic_cluster=cluster_id,
+                    topic_label=topic_lbl,
+                    questions=sub_qs,
+                    answers=sub_as,
+                    raw_text=sub_text,
+                    char_count=len(sub_text),
+                    token_estimate=len(sub_text) // 4,
+                    difficulty_hint=difficulty,
+                    has_sub_parts=any(b.has_sub_parts for b in sg),
+                    marks_hint=int(np.mean(marks_list)) if marks_list else None,
+                    year_hint=max(years_list) if years_list else None,
+                )
+                chunks.append(chunk)
+        else:
+            chunk = QnAChunk(
+                chunk_id=_make_id(combined_text, source_file, cluster_id),
+                source_file=source_file,
+                file_type=file_type,
+                page_range=[min(page_starts), max(page_ends)],
+                chunk_type=chunk_type,
+                topic_cluster=cluster_id,
+                topic_label=topic_lbl,
+                questions=all_questions,
+                answers=all_answers,
+                raw_text=combined_text,
+                char_count=len(combined_text),
+                token_estimate=len(combined_text) // 4,
+                difficulty_hint=difficulty,
+                has_sub_parts=has_sub,
+                marks_hint=int(np.mean(marks_list)) if marks_list else None,
+                year_hint=max(years_list) if years_list else None,
+            )
+            chunks.append(chunk)
+
+    return chunks
+
+
+# ── public API ────────────────────────────────────────────────────────────────
+
+def process_document(
+    file_path: str,
+    semantic_threshold: float = 0.45,
+    max_chunk_tokens: int = 800,
+    embedding_model: Optional[str] = None,
+    verbose: bool = True,
+) -> List[dict]:
+    """
+    Full pipeline: file → list of chunk dicts ready for vector DB / quiz engine.
+
+    Parameters
+    ----------
+    file_path          : path to PDF / DOCX / PPTX
+    semantic_threshold : cosine similarity threshold for same-cluster grouping
+                         lower  → more, finer-grained clusters
+                         higher → fewer, broader clusters
+    max_chunk_tokens   : maximum tokens per final chunk (hard split if exceeded)
+    embedding_model    : Gemini embedding model override
+    verbose            : print progress
+
+    Returns
+    -------
+    List of chunk dicts (JSON-serializable)
+    """
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    file_type = path.suffix.lower().lstrip(".")
+    if verbose:
+        print(f"[1/5] Extracting text from {path.name} ({file_type.upper()}) ...")
+
+    pages = extract_text_pages(str(path))
+    total_text = sum(len(t) for t, _ in pages)
+    if verbose:
+        print(f"      {len(pages)} pages, {total_text:,} chars")
+
+    if verbose:
+        print("[2/5] Detecting QnA blocks ...")
+    blocks = split_into_raw_blocks(pages)
+    if verbose:
+        print(f"      {len(blocks)} raw blocks detected")
+
+    if len(blocks) == 0:
+        print("      WARNING: No content blocks found.")
+        return []
+
+    if verbose:
+        print(f"[3/5] Embedding blocks with '{embedding_model or os.getenv('GEMINI_EMBEDDING_MODEL', 'gemini-embedding-2')}' ...")
+    embeddings = embed_blocks(blocks, model_name=embedding_model)
+
+    if verbose:
+        print(f"[4/5] Semantic clustering (threshold={semantic_threshold}) ...")
+    labels = semantic_cluster(embeddings, threshold=semantic_threshold)
+    n_clusters = len(set(labels))
+    if verbose:
+        print(f"      {n_clusters} semantic clusters formed")
+
+    if verbose:
+        print("[5/5] Assembling final chunks ...")
+    chunks = assemble_chunks(
+        blocks, labels, path.name, file_type, max_chunk_tokens=max_chunk_tokens
+    )
+    if verbose:
+        print(f"      ✓ {len(chunks)} chunks produced\n")
+
+    return [asdict(c) for c in chunks]
+
+
+def process_documents(
+    file_paths: List[str],
+    output_json: Optional[str] = None,
+    **kwargs,
+) -> List[dict]:
+    """Process multiple documents, optionally saving to JSON."""
+    all_chunks = []
+    for fp in file_paths:
+        try:
+            chunks = process_document(fp, **kwargs)
+            all_chunks.extend(chunks)
+            print(f"  → {len(chunks)} chunks from {Path(fp).name}")
+        except Exception as e:
+            print(f"  ✗ Error processing {fp}: {e}", file=sys.stderr)
+
+    if output_json:
+        out = Path(output_json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump(all_chunks, f, indent=2, ensure_ascii=False)
+        print(f"\nSaved {len(all_chunks)} total chunks → {output_json}")
+
+    return all_chunks

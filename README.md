@@ -1,6 +1,6 @@
 # AI Course Assistant
 
-Backend services for OCR, image chunking, document chunking, Gemini embeddings, Pinecone storage, and Redis/RQ background jobs.
+Backend services for OCR, image chunking, document chunking, audio transcription, Gemini embeddings, Pinecone storage, and Redis/RQ background jobs.
 
 The project has two main runtime parts:
 
@@ -16,11 +16,13 @@ apps/
     routes/
       image_chunking_jobs.py
       document_chunking_jobs.py
+      audio_chunking_jobs.py
       temp_chunk_preview.py
     pipelines/
       chunking pipeline/
         image pipeline/
         document pipeline/
+        audio pipeline/
 
   worker/
     run_worker.py
@@ -32,6 +34,7 @@ apps/
     services/
       image_chunking/
       document_chunking/
+      audio_chunking/
 ```
 
 ## What Each Pipeline Does
@@ -54,6 +57,16 @@ Supported files:
 
 ```text
 .pdf, .pptx, .ppt, .docx, .doc, .txt, .md
+```
+
+**Audio chunking**
+
+Accepts an audio path, generates a structured Gemini transcript, creates sliding-window, concept-block, and lecture-summary chunks, embeds them with Gemini, and stores them in Pinecone.
+
+Supported files:
+
+```text
+.aac, .flac, .m4a, .mp3, .mp4, .mpeg, .mpga, .ogg, .opus, .wav, .webm
 ```
 
 ## Requirements
@@ -99,16 +112,22 @@ Important values:
 REDIS_URL=redis://localhost:6379/0
 
 PINECONE_API_KEY=your_pinecone_key
-PINECONE_INDEX_NAME=rag-index
 PINECONE_ENVIRONMENT=us-east-1
 PINECONE_CLOUD=aws
-PINECONE_NAMESPACE=documents
+PINECONE_COURSE_INDEX_PREFIX=course
 
 GEMINI_API_KEY=your_gemini_key
 GEMINI_EMBEDDING_MODEL=gemini-embedding-2
 GEMINI_EMBEDDING_DIM=1536
+GEMINI_IMAGE_SUMMARY_MODEL=gemini-2.5-flash-lite
+GEMINI_TRANSCRIPTION_MODEL=gemini-2.5-flash
+ENABLE_IMAGE_SUMMARIES=true
 
 DOCUMENT_PDF_STRATEGY=hi_res
+IMAGE_CHUNKING_NAMESPACE=image-chunks
+DOCUMENT_CHUNKING_NAMESPACE=document-chunks
+AUDIO_CHUNKING_NAMESPACE=audio-chunks
+AUDIO_CHUNKING_QUEUE=audio-chunking
 ```
 
 ### Worker `.env`
@@ -125,29 +144,54 @@ Important values:
 REDIS_URL=redis://localhost:6379/0
 
 PINECONE_API_KEY=your_pinecone_key
-PINECONE_INDEX_NAME=rag-index
 PINECONE_ENVIRONMENT=us-east-1
 PINECONE_CLOUD=aws
-PINECONE_NAMESPACE=documents
+PINECONE_COURSE_INDEX_PREFIX=course
 
 GEMINI_API_KEY=your_gemini_key
 GEMINI_EMBEDDING_MODEL=gemini-embedding-2
 GEMINI_EMBEDDING_DIM=1536
+GEMINI_IMAGE_SUMMARY_MODEL=gemini-2.5-flash-lite
+GEMINI_TRANSCRIPTION_MODEL=gemini-2.5-flash
+ENABLE_IMAGE_SUMMARIES=true
 
 DOCUMENT_PDF_STRATEGY=hi_res
 
+IMAGE_CHUNKING_NAMESPACE=image-chunks
 IMAGE_CHUNKING_QUEUE=image-chunking
 IMAGE_CHUNKING_JOB_TIMEOUT=1800
 IMAGE_CHUNKING_RESULT_TTL=86400
 IMAGE_CHUNKING_FAILURE_TTL=604800
 
 DOCUMENT_CHUNKING_QUEUE=document-chunking
+DOCUMENT_CHUNKING_NAMESPACE=document-chunks
 DOCUMENT_CHUNKING_JOB_TIMEOUT=3600
 DOCUMENT_CHUNKING_RESULT_TTL=86400
 DOCUMENT_CHUNKING_FAILURE_TTL=604800
+
+AUDIO_CHUNKING_NAMESPACE=audio-chunks
+AUDIO_CHUNKING_QUEUE=audio-chunking
+AUDIO_CHUNKING_JOB_TIMEOUT=7200
+AUDIO_CHUNKING_RESULT_TTL=86400
+AUDIO_CHUNKING_FAILURE_TTL=604800
 ```
 
 For Upstash, put the Upstash Redis connection string in `REDIS_URL`.
+
+Each course stores vectors in its own Pinecone index. The index name is generated from `course_id`, for example:
+
+```text
+course-cs301-a1b2c3d4
+```
+
+Inside that index, fixed namespaces separate the ingestion types:
+
+```text
+document-chunks
+image-chunks
+qna-chunks
+audio-chunks
+```
 
 ## Setup
 
@@ -221,7 +265,21 @@ cd "C:\Users\Dell\OneDrive\Desktop\PROJECTS\AI Course Assistant"
 .\apps\api\.venv\Scripts\python.exe -m apps.worker.run_worker document-chunking
 ```
 
-Run each worker in a separate terminal when you want both queues active.
+### QnA Chunking Worker
+
+```powershell
+cd "C:\Users\Dell\OneDrive\Desktop\PROJECTS\AI Course Assistant"
+.\apps\api\.venv\Scripts\python.exe -m apps.worker.run_worker qna-chunking
+```
+
+### Audio Chunking Worker
+
+```powershell
+cd "C:\Users\Dell\OneDrive\Desktop\PROJECTS\AI Course Assistant"
+.\apps\api\.venv\Scripts\python.exe -m apps.worker.run_worker audio-chunking
+```
+
+Run each worker in a separate terminal when you want multiple queues active.
 
 ## API Routes
 
@@ -238,7 +296,10 @@ Body:
 ```json
 {
   "file_path": "C:\\Users\\Dell\\Downloads\\PublicWaterMassMailing.pdf",
-  "dpi": 300
+  "dpi": 300,
+  "course_id": "CS301",
+  "course_name": "",
+  "subject_area": ""
 }
 ```
 
@@ -281,7 +342,7 @@ Body:
   "file_paths": [
     "C:\\Users\\Dell\\Downloads\\course-notes.pdf"
   ],
-  "namespace": "documents"
+  "course_id": "CS301"
 }
 ```
 
@@ -307,6 +368,62 @@ Delete job:
 
 ```http
 DELETE /document-chunking/jobs/{job_id}
+```
+
+### QnA Chunking Jobs
+
+Create job:
+
+```http
+POST /qna-chunking/jobs
+```
+
+Body:
+
+```json
+{
+  "file_paths": [
+    "C:\\Users\\Dell\\Downloads\\question-bank.pdf"
+  ],
+  "course_id": "CS301",
+  "semantic_threshold": 0.45,
+  "max_chunk_tokens": 800
+}
+```
+
+Get result:
+
+```http
+GET /qna-chunking/jobs/{job_id}/result
+```
+
+### Audio Chunking Jobs
+
+Create job:
+
+```http
+POST /audio-chunking/jobs
+```
+
+Body:
+
+```json
+{
+  "file_path": "C:\\Users\\Dell\\Downloads\\lecture-01.mp3",
+  "course_id": "CS301",
+  "course_name": "",
+  "lecture_id": "",
+  "lecture_number": 0,
+  "week_number": 0,
+  "lecture_title": "",
+  "professor": ""
+}
+```
+
+When `lecture_id` is empty, the audio file name is used. Fetch the result with:
+
+```http
+GET /audio-chunking/jobs/{job_id}/result
 ```
 
 ## Temporary Chunk Preview Routes
@@ -428,6 +545,7 @@ Example worker start commands:
 ```bash
 python -m apps.worker.run_worker image-chunking
 python -m apps.worker.run_worker document-chunking
+python -m apps.worker.run_worker audio-chunking
 ```
 
 If using Upstash Redis, paste the Upstash Redis URL into `REDIS_URL` for both services.
@@ -488,8 +606,20 @@ Check:
 
 ```env
 PINECONE_API_KEY=
-PINECONE_INDEX_NAME=
+PINECONE_COURSE_INDEX_PREFIX=course
 GEMINI_API_KEY=
 GEMINI_EMBEDDING_MODEL=gemini-embedding-2
 GEMINI_EMBEDDING_DIM=1536
 ```
+
+**Pinecone created `image-chunks` as an index**
+
+That index was created by an older worker or queued job. In the current code, `image-chunks` is only a namespace, and the index is generated from `course_id`, for example `course-cs301-68e5fce5`.
+
+Restart both the API and worker after pulling changes:
+
+```powershell
+.\apps\api\.venv\Scripts\python.exe -m apps.worker.run_worker image-chunking
+```
+
+Then create a new job with `course_id` and without `namespace`. After confirming the new course index has the expected namespace, delete the old `image-chunks` index from the Pinecone dashboard if it only contains test data.

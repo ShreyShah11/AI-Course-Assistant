@@ -133,13 +133,21 @@ class OCRWorker:
     def process_file(self, file_path: str | Path,
                      dpi: int = 300) -> list[PageOCRResult]:
         """Process a local image or PDF file and return page-wise OCR results."""
+        return [
+            self._to_page_result(result)
+            for result in self.process_file_results(file_path, dpi=dpi)
+        ]
+
+    def process_file_results(self, file_path: str | Path,
+                             dpi: int = 300) -> list[Any]:
+        """Return raw OCR engine results for downstream semantic chunking."""
         path = Path(file_path)
         content = path.read_bytes()
 
         if path.suffix.lower() == ".pdf":
-            return self.process_scanned_pdf(content, dpi=dpi)
+            return self.process_scanned_pdf_results(content, dpi=dpi)
 
-        return [self.process_image(content, page_number=1)]
+        return [self.engine.run(content, page=1)]
 
     def process_scanned_pdf(self,
                             pdf_bytes: bytes,
@@ -148,6 +156,15 @@ class OCRWorker:
         Process a scanned PDF by rendering each page as an image
         and running the full pipeline on each page.
         """
+        return [
+            self._to_page_result(result)
+            for result in self.process_scanned_pdf_results(pdf_bytes, dpi=dpi)
+        ]
+
+    def process_scanned_pdf_results(self,
+                                    pdf_bytes: bytes,
+                                    dpi: int = 300) -> list[Any]:
+        """Return raw OCR engine results for every rendered PDF page."""
         if not FITZ_AVAILABLE:
             raise RuntimeError("PyMuPDF (fitz) is required for PDF processing. "
                                "pip install pymupdf")
@@ -156,7 +173,7 @@ class OCRWorker:
         for page_num, page_img in self._pdf_to_images(pdf_bytes, dpi):
             logger.info(f"Processing page {page_num}")
             result = self.engine.run(page_img, page=page_num)
-            results.append(self._to_page_result(result))
+            results.append(result)
 
         return results
 

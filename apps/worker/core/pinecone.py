@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+from hashlib import sha256
 from dataclasses import dataclass
 
 from apps.worker.core.config import load_environment
@@ -13,6 +15,36 @@ class PineconeSettings:
     cloud: str
     region: str
     namespace: str
+
+
+def _reserved_namespace_names() -> set[str]:
+    return {
+        "document-chunks",
+        "image-chunks",
+        "qna-chunks",
+        "audio-chunks",
+        os.getenv("DOCUMENT_CHUNKING_NAMESPACE", "document-chunks"),
+        os.getenv("IMAGE_CHUNKING_NAMESPACE", "image-chunks"),
+        os.getenv("QNA_CHUNKING_NAMESPACE", "qna-chunks"),
+        os.getenv("AUDIO_CHUNKING_NAMESPACE", "audio-chunks"),
+    }
+
+
+def get_course_index_name(course_id: str) -> str:
+    """Return a stable Pinecone-safe index name for one course."""
+    normalized_course_id = course_id.strip()
+    if not normalized_course_id:
+        raise ValueError("course_id is required to select the Pinecone index.")
+
+    slug = re.sub(r"[^a-z0-9]+", "-", normalized_course_id.lower()).strip("-")
+    slug = slug or "course"
+    digest = sha256(normalized_course_id.encode("utf-8")).hexdigest()[:8]
+    prefix = os.getenv("PINECONE_COURSE_INDEX_PREFIX", "course").strip().lower()
+    prefix = re.sub(r"[^a-z0-9]+", "-", prefix).strip("-") or "course"
+    prefix = prefix[:20].rstrip("-") or "course"
+    max_slug_length = 45 - len(prefix) - len(digest) - 2
+    slug = slug[:max_slug_length].rstrip("-") or "course"
+    return f"{prefix}-{slug}-{digest}"
 
 
 def get_pinecone_settings() -> PineconeSettings:
@@ -48,6 +80,11 @@ def ensure_index(
     settings = get_pinecone_settings()
     pc = get_pinecone_client()
     name = index_name or settings.index_name
+    if name in _reserved_namespace_names():
+        raise RuntimeError(
+            f"Refusing to create Pinecone index '{name}'. "
+            "That name is reserved for a namespace. Use course_id-based indexes instead."
+        )
     existing = [idx.name for idx in pc.list_indexes()]
 
     if name in existing:

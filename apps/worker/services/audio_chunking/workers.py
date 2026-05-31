@@ -12,19 +12,19 @@ from apps.worker.core.redis import get_redis_url
 from apps.worker.core.rq import QueueSettings, env_int, get_queue
 
 
-QUEUE_NAME = os.getenv("IMAGE_CHUNKING_QUEUE", "image-chunking")
+QUEUE_NAME = os.getenv("AUDIO_CHUNKING_QUEUE", "audio-chunking")
 JOB_FUNCTION = (
-    "apps.worker.services.image_chunking.jobs."
-    "process_image_chunking_request"
+    "apps.worker.services.audio_chunking.jobs."
+    "process_audio_chunking_request"
 )
 
 
 def get_queue_settings() -> QueueSettings:
     return QueueSettings(
         name=QUEUE_NAME,
-        timeout_seconds=env_int("IMAGE_CHUNKING_JOB_TIMEOUT", 1800),
-        result_ttl_seconds=env_int("IMAGE_CHUNKING_RESULT_TTL", 86400),
-        failure_ttl_seconds=env_int("IMAGE_CHUNKING_FAILURE_TTL", 604800),
+        timeout_seconds=env_int("AUDIO_CHUNKING_JOB_TIMEOUT", 7200),
+        result_ttl_seconds=env_int("AUDIO_CHUNKING_RESULT_TTL", 86400),
+        failure_ttl_seconds=env_int("AUDIO_CHUNKING_FAILURE_TTL", 604800),
     )
 
 
@@ -35,32 +35,32 @@ def get_service_queue() -> Queue:
 def enqueue_job(
     file_path: str,
     course_id: str,
-    dpi: int = 300,
     course_name: str = "",
-    subject_area: str = "",
+    lecture_id: str = "",
+    lecture_number: int = 0,
+    week_number: int = 0,
+    lecture_title: str = "",
+    professor: str = "",
 ) -> Job:
     settings = get_queue_settings()
     queue = get_service_queue()
+    kwargs = {
+        "file_path": file_path,
+        "course_id": course_id,
+        "course_name": course_name,
+        "lecture_id": lecture_id,
+        "lecture_number": lecture_number,
+        "week_number": week_number,
+        "lecture_title": lecture_title,
+        "professor": professor,
+    }
     return queue.enqueue(
         JOB_FUNCTION,
-        kwargs={
-            "file_path": file_path,
-            "dpi": dpi,
-            "course_id": course_id,
-            "course_name": course_name,
-            "subject_area": subject_area,
-        },
+        kwargs=kwargs,
         job_timeout=settings.timeout_seconds,
         result_ttl=settings.result_ttl_seconds,
         failure_ttl=settings.failure_ttl_seconds,
-        meta={
-            "file_path": file_path,
-            "dpi": dpi,
-            "course_id": course_id,
-            "course_name": course_name,
-            "subject_area": subject_area,
-            "queue": queue.name,
-        },
+        meta={**kwargs, "queue": queue.name},
     )
 
 
