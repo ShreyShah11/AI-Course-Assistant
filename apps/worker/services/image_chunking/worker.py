@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import os
+import socket
 import sys
+import time
+from urllib.parse import urlparse
 
 from redis import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
 from rq import Queue, SimpleWorker
 from rq.job import Job
 from rq.timeouts import TimerDeathPenalty
@@ -65,7 +69,31 @@ def enqueue_job(
 
 
 def run_worker() -> None:
-    connection = Redis.from_url(get_redis_url(), decode_responses=False)
+    redis_url = get_redis_url()
+    parsed_url = urlparse(redis_url)
+    redis_host = parsed_url.hostname or "localhost"
+    redis_port = parsed_url.port or 6379
+
+    for attempt in range(1, 6):
+        try:
+            socket.getaddrinfo(redis_host, redis_port)
+            connection = Redis.from_url(
+                redis_url,
+                decode_responses=False,
+                single_connection_client=True,
+            )
+            connection.ping()
+            break
+        except (OSError, RedisConnectionError) as exc:
+            if attempt == 5:
+                raise
+            wait_seconds = attempt * 2
+            print(
+                f"Redis connection failed for {redis_host}:{redis_port} ({exc}). "
+                f"Retrying in {wait_seconds}s "
+                f"({attempt}/5)..."
+            )
+            time.sleep(wait_seconds)
     worker = SimpleWorker([QUEUE_NAME], connection=connection)
     if sys.platform.startswith("win"):
         worker.death_penalty_class = TimerDeathPenalty

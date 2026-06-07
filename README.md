@@ -1,11 +1,11 @@
 # AI Course Assistant
 
-Backend services for OCR, image chunking, document chunking, audio transcription, Gemini embeddings, Pinecone storage, and Redis/RQ background jobs.
+Backend services for OCR, image chunking, document chunking, QnA chunking, audio transcription, YouTube transcript ingestion, handwritten-note ingestion, Gemini embeddings, Pinecone storage, and Redis/RQ background jobs.
 
 The project has two main runtime parts:
 
 - **FastAPI API**: accepts requests, validates file paths, creates RQ jobs, and exposes job/result routes.
-- **Background workers**: consume Redis/RQ queues and run the actual image/document processing pipelines.
+- **Background workers**: consume Redis/RQ queues and run the actual processing pipelines.
 
 ## Project Structure
 
@@ -16,13 +16,19 @@ apps/
     routes/
       image_chunking_jobs.py
       document_chunking_jobs.py
+      qna_chunking_jobs.py
       audio_chunking_jobs.py
+      youtube_chunking_jobs.py
+      handwritten_chunking_jobs.py
       temp_chunk_preview.py
     pipelines/
       chunking pipeline/
         image pipeline/
         document pipeline/
+        QnA pipeline/
         audio pipeline/
+        youtube pipeline/
+        handwritten pipeline/
 
   worker/
     run_worker.py
@@ -34,14 +40,17 @@ apps/
     services/
       image_chunking/
       document_chunking/
+      qna_chunking/
       audio_chunking/
+      youtube_chunking/
+      handwritten_chunking/
 ```
 
 ## What Each Pipeline Does
 
 **Image chunking**
 
-Accepts an image or scanned PDF path, runs preprocessing + Tesseract OCR, and returns page-wise OCR text with block metadata.
+Accepts an image or scanned PDF path, runs preprocessing + Tesseract OCR, falls back to Gemini OCR when confidence is low, creates efficient LLM-ready text chunks, enriches each chunk with Gemini metadata, embeds with Gemini, and stores vectors in Pinecone.
 
 Supported files:
 
@@ -68,6 +77,18 @@ Supported files:
 ```text
 .aac, .flac, .m4a, .mp3, .mp4, .mpeg, .mpga, .ogg, .opus, .wav, .webm
 ```
+
+**QnA chunking**
+
+Accepts question-answer style PDFs, creates retrieval chunks for questions and answers, embeds with Gemini, and stores them in Pinecone.
+
+**YouTube chunking**
+
+Accepts a YouTube URL, pulls video metadata and transcript, chunks transcript text without LLM enhancement, embeds with Gemini, and stores chunks in Pinecone.
+
+**Handwritten chunking**
+
+Accepts handwritten images or scanned PDFs, uses Gemini structured OCR with a prompt file, chunks the extracted text, embeds with Gemini, and stores chunks in Pinecone.
 
 ## Requirements
 
@@ -121,12 +142,21 @@ GEMINI_EMBEDDING_MODEL=gemini-embedding-2
 GEMINI_EMBEDDING_DIM=1536
 GEMINI_IMAGE_SUMMARY_MODEL=gemini-2.5-flash-lite
 GEMINI_TRANSCRIPTION_MODEL=gemini-2.5-flash
+HANDWRITTEN_FLASH_MODEL=gemini-2.5-flash
+HANDWRITTEN_PRO_MODEL=gemini-2.5-pro
+IMAGE_GEMINI_OCR_MODEL=gemini-2.5-flash
+IMAGE_GEMINI_TEXT_MODEL=gemini-2.5-flash
+IMAGE_GEMINI_ENRICH_MODEL=gemini-2.5-flash
+IMAGE_LOW_CONFIDENCE_THRESHOLD=60
 ENABLE_IMAGE_SUMMARIES=true
 
 DOCUMENT_PDF_STRATEGY=hi_res
 IMAGE_CHUNKING_NAMESPACE=image-chunks
 DOCUMENT_CHUNKING_NAMESPACE=document-chunks
+QNA_CHUNKING_NAMESPACE=qna-chunks
 AUDIO_CHUNKING_NAMESPACE=audio-chunks
+YOUTUBE_CHUNKING_NAMESPACE=youtube-chunks
+HANDWRITTEN_CHUNKING_NAMESPACE=handwritten-chunks
 AUDIO_CHUNKING_QUEUE=audio-chunking
 ```
 
@@ -153,6 +183,12 @@ GEMINI_EMBEDDING_MODEL=gemini-embedding-2
 GEMINI_EMBEDDING_DIM=1536
 GEMINI_IMAGE_SUMMARY_MODEL=gemini-2.5-flash-lite
 GEMINI_TRANSCRIPTION_MODEL=gemini-2.5-flash
+HANDWRITTEN_FLASH_MODEL=gemini-2.5-flash
+HANDWRITTEN_PRO_MODEL=gemini-2.5-pro
+IMAGE_GEMINI_OCR_MODEL=gemini-2.5-flash
+IMAGE_GEMINI_TEXT_MODEL=gemini-2.5-flash
+IMAGE_GEMINI_ENRICH_MODEL=gemini-2.5-flash
+IMAGE_LOW_CONFIDENCE_THRESHOLD=60
 ENABLE_IMAGE_SUMMARIES=true
 
 DOCUMENT_PDF_STRATEGY=hi_res
@@ -174,6 +210,18 @@ AUDIO_CHUNKING_QUEUE=audio-chunking
 AUDIO_CHUNKING_JOB_TIMEOUT=7200
 AUDIO_CHUNKING_RESULT_TTL=86400
 AUDIO_CHUNKING_FAILURE_TTL=604800
+
+YOUTUBE_CHUNKING_NAMESPACE=youtube-chunks
+YOUTUBE_CHUNKING_QUEUE=youtube-chunking
+YOUTUBE_CHUNKING_JOB_TIMEOUT=3600
+YOUTUBE_CHUNKING_RESULT_TTL=86400
+YOUTUBE_CHUNKING_FAILURE_TTL=604800
+
+HANDWRITTEN_CHUNKING_NAMESPACE=handwritten-chunks
+HANDWRITTEN_CHUNKING_QUEUE=handwritten-chunking
+HANDWRITTEN_CHUNKING_JOB_TIMEOUT=7200
+HANDWRITTEN_CHUNKING_RESULT_TTL=86400
+HANDWRITTEN_CHUNKING_FAILURE_TTL=604800
 ```
 
 For Upstash, put the Upstash Redis connection string in `REDIS_URL`.
@@ -191,7 +239,23 @@ document-chunks
 image-chunks
 qna-chunks
 audio-chunks
+youtube-chunks
+handwritten-chunks
 ```
+
+## Image Pipeline Flow
+
+The image pipeline now keeps OCR and metadata extraction separate:
+
+1. Preprocess the image or scanned PDF page.
+2. Run Tesseract OCR first.
+3. If OCR confidence is below `IMAGE_LOW_CONFIDENCE_THRESHOLD`, send that page image to Gemini OCR.
+4. If OCR confidence is good, send the Tesseract text to Gemini for cleanup, summary, topic, keywords, and page metadata.
+5. Build clean, section-aware text chunks from the Gemini-normalized page results.
+6. Send each chunk to Gemini for summary, topic, keywords, and content signals.
+7. Embed the chunk text with Gemini and upsert into the course Pinecone index under `image-chunks`.
+
+Because Gemini extracts the semantic metadata, the local image chunker no longer tries to detect code, formulas, definitions, examples, or content type by regex.
 
 ## Setup
 
@@ -277,6 +341,20 @@ cd "C:\Users\Dell\OneDrive\Desktop\PROJECTS\AI Course Assistant"
 ```powershell
 cd "C:\Users\Dell\OneDrive\Desktop\PROJECTS\AI Course Assistant"
 .\apps\api\.venv\Scripts\python.exe -m apps.worker.run_worker audio-chunking
+```
+
+### YouTube Chunking Worker
+
+```powershell
+cd "C:\Users\Dell\OneDrive\Desktop\PROJECTS\AI Course Assistant"
+.\apps\api\.venv\Scripts\python.exe -m apps.worker.run_worker youtube-chunking
+```
+
+### Handwritten Chunking Worker
+
+```powershell
+cd "C:\Users\Dell\OneDrive\Desktop\PROJECTS\AI Course Assistant"
+.\apps\api\.venv\Scripts\python.exe -m apps.worker.run_worker handwritten-chunking
 ```
 
 Run each worker in a separate terminal when you want multiple queues active.
@@ -426,6 +504,64 @@ When `lecture_id` is empty, the audio file name is used. Fetch the result with:
 GET /audio-chunking/jobs/{job_id}/result
 ```
 
+### YouTube Chunking Jobs
+
+Create job:
+
+```http
+POST /youtube-chunking/jobs
+```
+
+Body:
+
+```json
+{
+  "url": "https://www.youtube.com/watch?v=VIDEO_ID",
+  "course_id": "CS301",
+  "course_name": "",
+  "instructor": "",
+  "semester": "",
+  "subject": "",
+  "tags": [],
+  "languages": ["en"]
+}
+```
+
+Fetch the result with:
+
+```http
+GET /youtube-chunking/jobs/{job_id}/result
+```
+
+### Handwritten Chunking Jobs
+
+Create job:
+
+```http
+POST /handwritten-chunking/jobs
+```
+
+Body:
+
+```json
+{
+  "file_path": "C:\\Users\\Dell\\Downloads\\handwritten-notes.pdf",
+  "course_id": "CS301",
+  "course_name": "",
+  "subject": "",
+  "instructor": "",
+  "semester": "",
+  "university": "",
+  "tags": []
+}
+```
+
+Fetch the result with:
+
+```http
+GET /handwritten-chunking/jobs/{job_id}/result
+```
+
 ## Temporary Chunk Preview Routes
 
 These routes are only for debugging and learning the chunk output before using the background queue.
@@ -545,7 +681,10 @@ Example worker start commands:
 ```bash
 python -m apps.worker.run_worker image-chunking
 python -m apps.worker.run_worker document-chunking
+python -m apps.worker.run_worker qna-chunking
 python -m apps.worker.run_worker audio-chunking
+python -m apps.worker.run_worker youtube-chunking
+python -m apps.worker.run_worker handwritten-chunking
 ```
 
 If using Upstash Redis, paste the Upstash Redis URL into `REDIS_URL` for both services.

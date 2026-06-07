@@ -5,6 +5,7 @@ import re
 from hashlib import sha256
 from dataclasses import dataclass
 
+from pinecone import Pinecone
 from apps.worker.core.config import load_environment
 
 
@@ -64,8 +65,6 @@ def get_pinecone_settings() -> PineconeSettings:
 
 
 def get_pinecone_client() -> Pinecone:
-    from pinecone import Pinecone
-
     settings = get_pinecone_settings()
     return Pinecone(api_key=settings.api_key)
 
