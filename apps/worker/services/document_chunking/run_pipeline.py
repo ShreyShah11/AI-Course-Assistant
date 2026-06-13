@@ -55,21 +55,32 @@ def validate_file_paths(file_paths: list[str]) -> list[Path]:
 
 
 def load_ingestion_pipeline_module():
+    print("LOADER 1")
+
     load_environment("worker")
+
+    print("LOADER 2")
 
     if str(DOCUMENT_PIPELINE_DIR) not in sys.path:
         sys.path.insert(0, str(DOCUMENT_PIPELINE_DIR))
+
+    print("LOADER 3")
 
     spec = importlib.util.spec_from_file_location(
         "ingestion_pipeline_pinecone",
         PIPELINE_FILE,
     )
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load document chunking pipeline from {PIPELINE_FILE}")
+
+    print("LOADER 4")
 
     module = importlib.util.module_from_spec(spec)
-    sys.modules.setdefault("ingestion_pipeline_pinecone", module)
+
+    print("LOADER 5")
+
     spec.loader.exec_module(module)
+
+    print("LOADER 6")
+
     return module
 
 
@@ -82,17 +93,19 @@ def run_pipeline(
 
     if not os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
         raise RuntimeError("GEMINI_API_KEY or GOOGLE_API_KEY is not configured.")
-
+    print("GEMINI_API_KEY:", bool(os.getenv("GEMINI_API_KEY")))
+    print("GOOGLE_API_KEY:", bool(os.getenv("GOOGLE_API_KEY")))
+    print("PINECONE_API_KEY:", bool(os.getenv("PINECONE_API_KEY")))
     pipeline = load_ingestion_pipeline_module()
     target_namespace = os.getenv("DOCUMENT_CHUNKING_NAMESPACE", "document-chunks")
-
+    print("DEBUG: About to run ingestion pipeline")
     pipeline_result = pipeline.run_pipeline(
         file_paths=[str(path) for path in paths],
         namespace=target_namespace,
         index_name=target_index,
         course_id=course_id,
     ) or {}
-
+    print("DEBUG: Pipeline completed")
     return {
         "status": "completed",
         "file_count": len(paths),

@@ -1,4 +1,88 @@
-# AI Course Assistant
+# CourseGPT
+
+CourseGPT is a production-ready educational platform built around the existing LangChain RAG pipeline in this repository.
+The AI ingestion and retrieval code is intentionally kept separate from the web application layer.
+
+## Monorepo Layout
+
+```text
+frontend/               Documentation pointer for the CourseGPT frontend
+backend/                Documentation pointer for the CourseGPT backend
+langchain_pipeline/     Documentation pointer for the existing AI boundary
+
+apps/
+  web/                  Next.js 15 + TypeScript + Tailwind UI
+  api/                  FastAPI product API, PostgreSQL models, Alembic migrations
+  worker/               Existing Redis/RQ workers that run ingestion pipelines
+```
+
+The existing pipeline remains in `apps/api/pipelines` and `apps/worker/services`. CourseGPT calls it through
+`apps/api/app/services/langchain_adapter.py`.
+
+## CourseGPT Features
+
+- JWT authentication with password hashing and teacher/student role protection.
+- Teacher workflows for course creation, material upload, YouTube ingestion, student lists, analytics, and exam generation.
+- Student workflows for enrollment, course materials, course-specific AI chat, summaries, flashcards, quizzes, quiz history, and progress.
+- PostgreSQL schema for users, courses, enrollments, materials, chat history, quizzes, and quiz results.
+- Course-specific retrieval via the existing Pinecone index naming strategy.
+- Citation/source display from retrieved chunks.
+- Responsive Next.js UI with dark-mode-aware theme tokens.
+
+## CourseGPT Backend
+
+From `apps/api`:
+
+```powershell
+Copy-Item .env.example .env
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+alembic upgrade head
+uvicorn main:app --reload --reload-dir . --reload-exclude ".venv/*" --host 127.0.0.1 --port 8000
+```
+
+Important environment values:
+
+```env
+DATABASE_URL=postgresql+psycopg2://coursegpt:coursegpt@localhost:5432/coursegpt
+JWT_SECRET_KEY=replace-with-a-long-random-secret
+UPLOAD_DIR=../../storage/materials
+REDIS_URL=redis://localhost:6379/0
+PINECONE_API_KEY=your_pinecone_key
+GEMINI_API_KEY=your_gemini_key
+```
+
+## CourseGPT Frontend
+
+From `apps/web`:
+
+```powershell
+Copy-Item .env.example .env.local
+pnpm install
+pnpm dev
+```
+
+Local frontend URL:
+
+```text
+http://127.0.0.1:3000
+```
+
+## Deployment
+
+Deploy these services separately:
+
+- FastAPI web service from `apps/api`, running `uvicorn main:app --host 0.0.0.0 --port $PORT`.
+- PostgreSQL database with `DATABASE_URL` configured for the API.
+- Redis instance shared by the API and workers.
+- One background worker per ingestion queue from the project root, for example `python -m apps.worker.run_worker document-chunking`.
+- Next.js web app from `apps/web`, with `NEXT_PUBLIC_API_URL` pointing at the deployed FastAPI API.
+
+Run `alembic upgrade head` during backend release setup before serving traffic.
+
+# Original AI Course Assistant Notes
 
 Backend services for OCR, image chunking, document chunking, QnA chunking, audio transcription, YouTube transcript ingestion, handwritten-note ingestion, Gemini embeddings, Pinecone storage, and Redis/RQ background jobs.
 

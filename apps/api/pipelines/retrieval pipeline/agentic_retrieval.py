@@ -208,7 +208,7 @@ class QueryPlan(BaseModel):
         "topic_overview",
         "clarification",
     ] = Field(..., description="Primary category of the query.")
-    key_concepts: list[str] = Field(..., min_length=1, max_length=10, description="Core concepts central to this query.")
+    key_concepts: list[str] = Field(..., min_length=2, max_length=10, description="Core concepts central to this query.")
     complexity_level: Literal["basic", "intermediate", "advanced"] = Field(
         ...,
         description="basic=2 sub-queries, intermediate=3-4, advanced=4-5.",
@@ -216,7 +216,7 @@ class QueryPlan(BaseModel):
 
     # ── Sub-queries ──────────────────────────────────────────────────────────
     sub_queries: list[SubQuery] = Field(
-        ..., min_length=2, max_length=5,
+        ..., min_length=1, max_length=5,
         description=(
             "2-5 semantically diverse sub-queries targeting different facets. "
             "NEVER paraphrase — each must retrieve different content. "
@@ -716,11 +716,15 @@ def _build_planner_user_prompt(query: str, course_id: str, mode: RetrievalMode) 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gemini client helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
 def _gemini_client() -> genai.Client:
-    if not GEMINI_API_KEY:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+
+    print("ACTIVE GEMINI KEY:", api_key[:20] if api_key else "NONE")
+
+    if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set.")
-    return genai.Client(api_key=GEMINI_API_KEY.strip())
+
+    return genai.Client(api_key=api_key)
 
 
 def _embed(text: str) -> list[float]:
@@ -751,25 +755,49 @@ def _generate_planner_content(
 ):
     last_exc: Exception | None = None
     tried_models: set[str] = set()
+
     for model in [PLANNER_MODEL, PLANNER_FALLBACK_MODEL]:
         if not model:
             continue
+
         if model in tried_models:
             continue
+
         tried_models.add(model)
+
         try:
             client = _gemini_client()
-            return client.models.generate_content(
+
+            print("\n===== PLANNER DEBUG =====")
+            print("MODEL:", model)
+            print("KEY PREFIX:", os.getenv("GEMINI_API_KEY", "")[:20])
+            print("=========================\n")
+
+            response = client.models.generate_content(
                 model=model,
                 contents=contents,
                 config=config,
             )
+
+            print("✅ GEMINI CALL SUCCESS")
+
+            return response
+
         except Exception as exc:
+            print("\n===== GEMINI ERROR =====")
+            print("MODEL:", model)
+            print(type(exc).__name__)
+            print(exc)
+            print("========================\n")
+
             last_exc = exc
+
             if not _is_retryable_gemini_error(exc):
                 raise
+
     if last_exc:
         raise last_exc
+
     raise RuntimeError("No Gemini planner model is configured.")
 
 
@@ -784,6 +812,10 @@ def run_planner(query: str, course_id: str, mode: RetrievalMode) -> QueryPlan:
         + "\n\nReturn only valid JSON that can be parsed into this Pydantic model schema:\n"
         + json.dumps(QueryPlan.model_json_schema(), ensure_ascii=True)
     )
+    print("\n===== PLANNER DEBUG =====")
+    print("QUERY:", query)
+    print("MODEL:", PLANNER_MODEL)
+    print("=========================\n")
     response = _generate_planner_content(
         contents=user_prompt,
         config=types.GenerateContentConfig(

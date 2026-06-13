@@ -27,6 +27,7 @@ QUICK START
 ===================================================================
 """
 
+print("TOP OF FILE")
 import hashlib
 import json
 import os
@@ -41,22 +42,29 @@ for stream in (sys.stdout, sys.stderr):
     if hasattr(stream, "reconfigure"):
         stream.reconfigure(encoding="utf-8", errors="replace")
 
-
+print("AFTER LANGCHAIN IMPORTS")
 # ── LangChain ────────────────────────────────────────────────────
 from langchain_core.documents import Document
 from pydantic import BaseModel, Field
 
+print("AFTER GOOGLE IMPORTS")
 # ── Gemini embeddings ────────────────────────────────────────────
 from google import genai
 from google.genai import types
 
+
 # ── Pinecone v3+ ─────────────────────────────────────────────────
 from pinecone import Pinecone, ServerlessSpec
-
+print("AFTER PINECONE IMPORTS")
 # ── Unstructured (universal parser) ──────────────────────────────
-from unstructured.partition.auto import partition
+print("IMPORTING partition")
+from unstructured.partition.pdf import partition_pdf
+from unstructured.partition.docx import partition_docx
+from unstructured.partition.pptx import partition_pptx
+from unstructured.partition.text import partition_text
+print("IMPORTING partition")
 from unstructured.chunking.title import chunk_by_title
-
+print("AFTER UNSTRUCTURED IMPORTS")
 
 # ════════════════════════════════════════════════════════════════
 #  CONFIGURATION
@@ -275,18 +283,24 @@ def partition_document(file_path: str) -> list:
 
     if ext == ".pdf":
         kwargs.update(
-            strategy=PDF_PARTITION_STRATEGY,
-            infer_table_structure=True,
-            extract_image_block_types=["Image"],
-            extract_image_block_to_payload=True,
-        )
+            strategy="fast"
+    )
     elif ext in {".pptx", ".ppt"}:
         kwargs.update(include_page_breaks=True)
     elif ext in {".docx", ".doc"}:
         kwargs.update(infer_table_structure=True)
     # .txt / .md → no extra kwargs needed
 
-    elements = partition(**kwargs)
+    if ext == ".pdf":
+        elements = partition_pdf(**kwargs)
+    elif ext in {".pptx", ".ppt"}:
+        elements = partition_pptx(**kwargs)
+    elif ext in {".docx", ".doc"}:
+        elements = partition_docx(**kwargs)
+    elif ext in {".txt", ".md"}:
+        elements = partition_text(filename=str(path))
+    else:
+        raise ValueError(f"Unsupported file type: {ext}")
     print(f"   ✅  {len(elements)} elements extracted")
     return elements
 
@@ -572,8 +586,12 @@ def store_in_pinecone(
       40 KB per-vector metadata limit.
     """
     print("\n📌  Embedding & upserting to Pinecone …")
-
     pc = Pinecone(api_key=PINECONE_API_KEY)
+    print("\n========== PINECONE DEBUG ==========")
+    print("API KEY PREFIX:", PINECONE_API_KEY[:10])
+    print("INDEXES:", pc.list_indexes())
+    print("TARGET INDEX:", index_name)
+    print("====================================\n")
     _get_or_create_index(pc, index_name=index_name)
     index = pc.Index(index_name)
 
@@ -681,12 +699,21 @@ def run_pipeline(
         print(f"  FILE  →  {fp}")
         print("=" * 60)
         try:
+            print("BEFORE partition_document")
             elements = partition_document(fp)
-            chunks   = create_chunks(elements)
-            docs     = build_documents(chunks, source_file=fp, course_id=course_id)
+            print("AFTER partition_document")
+            print("BEFORE create_chunks")
+            chunks = create_chunks(elements)
+            print("AFTER create_chunks")
+            print("BEFORE build_documents")
+            docs = build_documents(
+                chunks,
+                source_file=fp,
+                course_id=course_id,)
+            print("AFTER build_documents")
             all_docs.extend(docs)
         except Exception as exc:
-            print(f"\n  ❌  Failed to process '{fp}': {exc}")
+            print(f"\n❌ Failed to process '{fp}': {exc}")
             failures.append(f"{fp}: {exc}")
             continue
 

@@ -162,6 +162,10 @@ spacy==3.8.14
 spacy-legacy==3.0.12
 spacy-loggers==1.0.5
 SQLAlchemy==2.0.49
+alembic==1.17.2
+passlib[bcrypt]==1.7.4
+psycopg2-binary==2.9.11
+python-jose[cryptography]==3.5.0
 srsly==2.5.3
 starlette==0.37.2
 sympy==1.14.0

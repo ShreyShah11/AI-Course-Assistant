@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import traceback
 import importlib.util
 import os
 import sys
@@ -182,7 +182,7 @@ def run_retrieval(request: RetrievalRequest, mode: Literal["ask", "quiz", "summa
             course_id=request.course_id,
             mode=pipeline.RetrievalMode(mode),
             top_k=request.top_k,
-            verbose=False,
+            verbose=True,
         )
         answer_prompt = result.to_answer_prompt()
         stage = "generate final response"
@@ -203,8 +203,11 @@ def run_retrieval(request: RetrievalRequest, mode: Literal["ask", "quiz", "summa
         payload["pinecone_index"] = pipeline.get_course_index_name(request.course_id)
         return payload
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Retrieval failed during {stage}: {exc}") from exc
-
+        traceback.print_exc()
+        raise HTTPException(
+        status_code=500,
+        detail=f"Retrieval failed during {stage}: {exc}"
+    ) from exc
 
 def ask_controller(request: AskRetrievalRequest) -> dict:
     return run_retrieval(request, "ask")
