@@ -345,9 +345,6 @@ Because Gemini extracts the semantic metadata, the local image chunker no longer
 
 From the project root:
 
-```powershell
-cd "C:\Users\Dell\OneDrive\Desktop\PROJECTS\AI Course Assistant"
-```
 
 Create and activate the API virtual environment:
 
@@ -776,7 +773,7 @@ Start Redis or configure `REDIS_URL` with Upstash.
 Start API:
 
 ```powershell
-cd "C:\Users\Dell\OneDrive\Desktop\PROJECTS\AI Course Assistant\apps\api"
+cd ".\apps\api"
 .\.venv\Scripts\Activate.ps1
 uvicorn main:app --host 127.0.0.1 --port 8000
 ```
@@ -784,7 +781,6 @@ uvicorn main:app --host 127.0.0.1 --port 8000
 Start worker:
 
 ```powershell
-cd "C:\Users\Dell\OneDrive\Desktop\PROJECTS\AI Course Assistant"
 .\apps\api\.venv\Scripts\python.exe -m apps.worker.run_worker image-chunking
 ```
 

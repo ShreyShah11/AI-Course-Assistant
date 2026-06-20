@@ -29,6 +29,7 @@ from routes.image_chunking_jobs import router as image_chunking_jobs_router
 from routes.qna_chunking_jobs import router as qna_chunking_jobs_router
 from routes.temp_chunk_preview import router as temp_chunk_preview_router
 from routes.youtube_chunking_jobs import router as youtube_chunking_jobs_router
+from routes.evals import router as evals_router
 from app.routers.auth import router as coursegpt_auth_router
 from app.routers.chat import router as coursegpt_chat_router
 from app.routers.courses import router as coursegpt_courses_router
@@ -71,6 +72,11 @@ app.include_router(coursegpt_quiz_router)
 app.include_router(temp_chunk_preview_router)
 if image_processing_router is not None:
     app.include_router(image_processing_router)
+
+
+# LOCAL EVAL — hidden from OpenAPI docs, for local use only.
+# Hit POST /internal/evals/run from Postman or curl to run the evaluation suite.
+app.include_router(evals_router)
 
 
 @app.get("/health")
