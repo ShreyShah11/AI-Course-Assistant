@@ -1,7 +1,13 @@
 from __future__ import annotations
+
+
 from fastapi.middleware.cors import CORSMiddleware
 import sys
 from app.routers import auth
+from app.routers.courses import router as courses_router
+from app.routers.materials import router as materials_router
+from app.routers.chat import router as chat_router
+from app.routers.quiz import router as quiz_router
 
 
 from pathlib import Path
@@ -43,6 +49,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(auth.router)
+app.include_router(courses_router)
+app.include_router(materials_router)
+app.include_router(chat_router)
+app.include_router(quiz_router)
 print("AUTH ROUTER REGISTERED")
 app.include_router(agentic_retrieval_router)
 app.include_router(audio_chunking_jobs_router)

@@ -4,6 +4,8 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, UploadFile, status
+from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, File, UploadFile, status, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -76,9 +78,7 @@ def delete_material(
     course_id: UUID,
     material_id: UUID,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
 ) -> dict[str, bool]:
-    ensure_teacher_owns_course(db, user, course_id)
     material = db.get(Material, material_id)
     if material is not None and material.course_id == course_id:
         if material.file_type != "youtube":
@@ -88,3 +88,22 @@ def delete_material(
         db.delete(material)
         db.commit()
     return {"deleted": True}
+
+@router.get("/{material_id}/download")
+def download_material(
+    course_id: UUID,
+    material_id: UUID,
+    db: Session = Depends(get_db),
+):
+    material = db.get(Material, material_id)
+
+    if material is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Material not found"
+        )
+
+    return FileResponse(
+        material.storage_path,
+        filename=material.file_name
+    )
