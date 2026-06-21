@@ -29,7 +29,16 @@ try:
 except ImportError:
     image_processing_router = None
 
-app = FastAPI(title="AI Course Assistant API")
+
+app = FastAPI(title="CourseGPT API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(agentic_retrieval_router)
 app.include_router(audio_chunking_jobs_router)

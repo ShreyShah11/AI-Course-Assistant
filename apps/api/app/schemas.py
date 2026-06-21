@@ -118,3 +118,18 @@ class QuizResultOut(BaseModel):
     score: int
     answers: dict[str, Any]
     created_at: datetime
+
+class SendOTPRequest(BaseModel):
+    email: EmailStr
+
+
+class VerifyOTPRequest(BaseModel):
+    email: EmailStr
+    otp: str
+
+
+class RegisterRequest(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    role: UserRole

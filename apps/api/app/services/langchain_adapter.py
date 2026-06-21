@@ -41,17 +41,29 @@ def enqueue_ingestion(*, file_path: str, course_id: str, file_type: str) -> str 
 
 def extract_sources(retrieval_payload: dict[str, Any]) -> list[dict[str, Any]]:
     chunks = retrieval_payload.get("chunks") or []
-    sources: list[dict[str, Any]] = []
+    sources = []
+
     for index, chunk in enumerate(chunks, start=1):
-        metadata = chunk.get("metadata") if isinstance(chunk, dict) else getattr(chunk, "metadata", {})
-        text = chunk.get("text") if isinstance(chunk, dict) else getattr(chunk, "text", "")
+
+        if isinstance(chunk, dict):
+            metadata = chunk.get("metadata") or {}
+            text = chunk.get("text") or ""
+        else:
+            metadata = getattr(chunk, "metadata", {}) or {}
+            text = getattr(chunk, "text", "") or ""
+
         sources.append(
             {
                 "citation": index,
-                "document": metadata.get("source") or metadata.get("file_name") or metadata.get("title") or "Course material",
-                "page": metadata.get("page") or metadata.get("page_number"),
-                "preview": (text or "")[:320],
+                "document": metadata.get("source")
+                or metadata.get("file_name")
+                or metadata.get("title")
+                or "Course material",
+                "page": metadata.get("page")
+                or metadata.get("page_number"),
+                "preview": text[:320],
                 "metadata": metadata,
             }
         )
+
     return sources
