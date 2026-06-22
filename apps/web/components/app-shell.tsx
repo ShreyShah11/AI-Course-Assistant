@@ -20,8 +20,6 @@ const teacherLinks = [
   { href: "/teacher/dashboard", label: "Dashboard", icon: LayoutDashboard },
   { href: "/teacher/courses", label: "Courses", icon: BookOpen },
   { href: "/teacher/upload", label: "Materials", icon: Upload },
-  { href: "/teacher/analytics", label: "Analytics", icon: BarChart3 },
-  { href: "/teacher/exams", label: "Exams", icon: GraduationCap },
 ];
 
 const studentLinks = [
@@ -29,7 +27,7 @@ const studentLinks = [
   { href: "/student/courses", label: "My Courses", icon: BookOpen },
   { href: "/student/chat", label: "Course Chat", icon: GraduationCap },
   { href: "/student/quizzes", label: "Quizzes", icon: Upload },
-  { href: "/student/progress", label: "Progress", icon: BarChart3 },
+  { href: "/student/history", label: "History", icon: BarChart3 },
 ];
 
 export function AppShell({

@@ -9,6 +9,10 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy import Column, Boolean
 from app.db.session import Base
+from sqlalchemy import Column, String, Text, DateTime, ForeignKey
+from sqlalchemy.sql import func
+import uuid
+
 
 
 class UserRole(str, enum.Enum):
