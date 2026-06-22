@@ -28,6 +28,7 @@ QUICK START
 """
 
 print("TOP OF FILE")
+import asyncio
 import hashlib
 import json
 import os
@@ -77,8 +78,9 @@ PINECONE_ENV        = os.getenv("PINECONE_ENVIRONMENT", "us-east-1")
 PINECONE_CLOUD      = os.getenv("PINECONE_CLOUD", "aws")
 PINECONE_NAMESPACE  = os.getenv("PINECONE_NAMESPACE", "documents")
 
-EMBEDDING_MODEL = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2")
-EMBEDDING_DIM   = int(os.getenv("GEMINI_EMBEDDING_DIM", "1536"))
+EMBEDDING_MODEL       = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-2")
+EMBEDDING_DIM         = int(os.getenv("GEMINI_EMBEDDING_DIM", "1536"))
+EMBEDDING_CONCURRENCY = int(os.getenv("EMBEDDING_CONCURRENCY", "10"))  # max concurrent Gemini embed calls
 IMAGE_SUMMARY_MODEL = os.getenv("GEMINI_IMAGE_SUMMARY_MODEL", "gemini-2.5-flash-lite")
 ENABLE_IMAGE_SUMMARIES = os.getenv("ENABLE_IMAGE_SUMMARIES", "true").lower() == "true"
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
@@ -88,10 +90,16 @@ IMAGE_SUMMARY_PROMPT_FILE = PROMPTS_DIR / "image_summary_few_shot.md"
 # layout/table/image structure for downstream retrieval quality.
 PDF_PARTITION_STRATEGY = os.getenv("DOCUMENT_PDF_STRATEGY", "hi_res").lower()
 
+# Use hi_res only when image summarization is enabled AND caller requests it.
+# hi_res is 10-20x slower (runs layout detection + Tesseract OCR).
+# For text-native PDFs (most course slides/papers), fast is sufficient.
+PDF_USE_HI_RES_FOR_IMAGES = os.getenv("PDF_USE_HI_RES_FOR_IMAGES", "true").lower() == "true"
+
 # Chunking knobs
 CHUNK_MAX_CHARS = 3000
 CHUNK_NEW_AFTER = 2400
 CHUNK_MIN_CHARS = 500
+CHUNK_OVERLAP   = int(os.getenv("CHUNK_OVERLAP", "200"))
 
 # Keyword extraction
 MAX_KEYWORDS    = 12    # top N keywords stored per chunk
@@ -282,9 +290,14 @@ def partition_document(file_path: str) -> list:
     kwargs: dict = {"filename": str(path)}
 
     if ext == ".pdf":
-        kwargs.update(
-            strategy="fast"
-    )
+        # Determine strategy:
+        # hi_res extracts image base64 payloads but is 10-20x slower.
+        # Only use it when image summarization is enabled AND explicitly requested.
+        # For text-native PDFs (most course materials), fast is correct.
+        use_hi_res = ENABLE_IMAGE_SUMMARIES and PDF_USE_HI_RES_FOR_IMAGES
+        pdf_strategy = "hi_res" if use_hi_res else "fast"
+        print(f"   PDF strategy: {pdf_strategy} (ENABLE_IMAGE_SUMMARIES={ENABLE_IMAGE_SUMMARIES}, PDF_USE_HI_RES_FOR_IMAGES={PDF_USE_HI_RES_FOR_IMAGES})")
+        kwargs.update(strategy=pdf_strategy)
     elif ext in {".pptx", ".ppt"}:
         kwargs.update(include_page_breaks=True)
     elif ext in {".docx", ".doc"}:
@@ -322,6 +335,8 @@ def create_chunks(elements: list) -> list:
         max_characters=CHUNK_MAX_CHARS,
         new_after_n_chars=CHUNK_NEW_AFTER,
         combine_text_under_n_chars=CHUNK_MIN_CHARS,
+        overlap=CHUNK_OVERLAP,
+        overlap_all=False,
     )
     print(f"   ✅  {len(chunks)} chunks created")
     return chunks
@@ -533,26 +548,62 @@ def _get_gemini_client() -> genai.Client:
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
+async def _embed_single_text_async(
+    client,
+    text: str,
+    task_type: str,
+) -> list:
+    """Embed one text asynchronously using asyncio.to_thread()."""
+    result = await asyncio.to_thread(
+        client.models.embed_content,
+        model=EMBEDDING_MODEL,
+        contents=text if text.strip() else " ",
+        config=types.EmbedContentConfig(
+            task_type=task_type,
+            output_dimensionality=EMBEDDING_DIM,
+        ),
+    )
+    return result.embeddings[0].values
+
+
+async def _embed_texts_async(
+    texts: list,
+    task_type: str,
+) -> list:
+    """
+    Embed all texts concurrently, bounded by EMBEDDING_CONCURRENCY.
+    Uses asyncio.to_thread() to run the sync SDK call in a thread pool.
+    Semaphore prevents QPM rate-limit hits.
+    Includes exponential backoff on 429 errors.
+    """
+    client    = _get_gemini_client()
+    semaphore = asyncio.Semaphore(EMBEDDING_CONCURRENCY)
+
+    async def _embed_with_semaphore(text: str) -> list:
+        async with semaphore:
+            for attempt in range(4):
+                try:
+                    return await _embed_single_text_async(client, text, task_type)
+                except Exception as e:
+                    if "429" in str(e) or "quota" in str(e).lower():
+                        wait = (2 ** attempt) + (0.1 * attempt)
+                        print(f"   Rate limited, retrying in {wait:.1f}s...")
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
+            raise RuntimeError("Embedding failed after 4 attempts")
+
+    tasks = [_embed_with_semaphore(text) for text in texts]
+    return await asyncio.gather(*tasks)
+
+
 def _embed_texts_with_gemini(
     texts: List[str],
     task_type: str,
-    batch_size: int = 100,
+    batch_size: int = 100,   # kept for API compatibility, not used
 ) -> List[list]:
-    client = _get_gemini_client()
-    vectors: List[list] = []
-
-    for text in texts:
-        result = client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=text if text.strip() else " ",
-            config=types.EmbedContentConfig(
-                task_type=task_type,
-                output_dimensionality=EMBEDDING_DIM,
-            ),
-        )
-        vectors.append(result.embeddings[0].values)
-
-    return vectors
+    """Public sync wrapper — runs the async embedder in a fresh event loop."""
+    return asyncio.run(_embed_texts_async(texts, task_type))
 
 def _get_or_create_index(pc: Pinecone, index_name: str) -> None:
     existing = [idx.name for idx in pc.list_indexes()]
