@@ -333,7 +333,7 @@ export default function RegisterPage() {
 
                 <Button
                   type="button"
-                  variant="outline"
+                  variant="secondary"
                   onClick={sendOtp}
                 >
                   Resend
