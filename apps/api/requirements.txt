@@ -151,7 +151,6 @@ python-oxmsg==0.0.2
 python-pptx==1.0.2
 pytubefix==10.9.0
 pytz==2026.2
-pywin32==312
 PyYAML==6.0.3
 qdrant-client==1.18.0
 rank-bm25==0.2.2
