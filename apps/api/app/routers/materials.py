@@ -15,7 +15,8 @@ from app.models import Material, User
 from app.schemas import MaterialOut, YouTubeMaterialCreate
 from app.services.langchain_adapter import enqueue_ingestion
 from app.services.permissions import ensure_course_member, ensure_teacher_owns_course
-from app.services.storage import store_upload
+from fastapi.responses import RedirectResponse
+from app.services.storage import store_upload, create_download_url, delete_upload
 
 
 router = APIRouter(prefix="/courses/{course_id}/materials", tags=["materials"])
@@ -82,9 +83,7 @@ def delete_material(
     material = db.get(Material, material_id)
     if material is not None and material.course_id == course_id:
         if material.file_type != "youtube":
-            path = Path(material.storage_path)
-            if path.exists() and path.is_file():
-                path.unlink()
+            delete_upload(material.storage_path)
         db.delete(material)
         db.commit()
     return {"deleted": True}
@@ -98,12 +97,8 @@ def download_material(
     material = db.get(Material, material_id)
 
     if material is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Material not found"
-        )
+        raise HTTPException(status_code=404, detail="Material not found")
 
-    return FileResponse(
-        material.storage_path,
-        filename=material.file_name
-    )
+    url = create_download_url(material.storage_path)
+
+    return RedirectResponse(url)

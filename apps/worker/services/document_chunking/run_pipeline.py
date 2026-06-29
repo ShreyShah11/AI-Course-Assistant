@@ -8,6 +8,7 @@ from typing import Any
 
 from apps.worker.core.config import load_environment
 from apps.worker.core.pinecone import get_course_index_name
+from apps.worker.core.storage import download_to_temp
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -34,15 +35,24 @@ SUPPORTED_EXTENSIONS = {
 
 def validate_file_paths(file_paths: list[str]) -> list[Path]:
     paths = []
+
     for file_path in file_paths:
+
+        # NEW
+        if not Path(file_path).exists():
+            file_path = str(download_to_temp(file_path))
+
         path = Path(file_path).expanduser()
+
         if not path.is_absolute():
             path = (Path.cwd() / path).resolve()
 
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
+
         if not path.is_file():
             raise ValueError(f"Path is not a file: {path}")
+
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             raise ValueError(
                 "Unsupported file type. Supported: "
