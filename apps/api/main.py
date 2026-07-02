@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 
 from fastapi.middleware.cors import CORSMiddleware
 import sys
@@ -41,10 +42,16 @@ except ImportError:
 
 app = FastAPI(title="CourseGPT API")
 
+_CORS_ORIGINS = [
+    o.strip()
+    for o in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=_CORS_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )

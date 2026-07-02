@@ -1,0 +1,251 @@
+# render.yaml — Infrastructure as Code for Render.com
+# ─────────────────────────────────────────────────────────────────────────────
+# Commit this to the root of your repo.
+# Render auto-detects it and creates all services in one click.
+#
+# Architecture:
+#   • API    (Docker)  — apps/api/Dockerfile  — runs uvicorn
+#   • Worker (Docker)  — apps/api/Dockerfile  — same image, overrides CMD
+#   • Web    (Node)    — apps/web/            — npm build + start (no Docker)
+#   • PostgreSQL       — Render managed
+#   • Redis            — Render managed
+#
+# Only ONE Dockerfile needed (apps/api/Dockerfile).
+# The API's requirements.txt covers everything the worker needs (rq, redis,
+# torch, pinecone, etc.), so both services share the exact same image.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── 1. FastAPI Backend ──────────────────────────────────────────────────────
+  - type: web
+    name: coursegpt-api
+    runtime: docker
+    dockerfilePath: apps/api/Dockerfile   # shared image
+    dockerContext: .                       # monorepo root
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: DATABASE_URL
+        fromDatabase:
+          name: coursegpt-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: coursegpt-redis
+          property: connectionString
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      # After first deploy, update this to your web URL:
+      # e.g. https://coursegpt-web.onrender.com
+      - key: CORS_ALLOWED_ORIGINS
+        value: http://localhost:3000
+      # ── Secrets: set these manually in the Render dashboard ──────────────
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      # ── Pinecone ──────────────────────────────────────────────────────────
+      - key: PINECONE_ENVIRONMENT
+        value: us-east-1
+      - key: PINECONE_CLOUD
+        value: aws
+      - key: PINECONE_COURSE_INDEX_PREFIX
+        value: course
+      # ── Gemini models ─────────────────────────────────────────────────────
+      - key: GEMINI_EMBEDDING_MODEL
+        value: gemini-embedding-2
+      - key: GEMINI_EMBEDDING_DIM
+        value: 1536
+      - key: EMBEDDING_CONCURRENCY
+        value: 10
+      - key: GEMINI_IMAGE_SUMMARY_MODEL
+        value: gemini-2.5-flash-lite
+      - key: GEMINI_TRANSCRIPTION_MODEL
+        value: gemini-2.5-flash
+      - key: GEMINI_RETRIEVAL_PLANNER_MODEL
+        value: gemini-2.5-flash
+      - key: GEMINI_RETRIEVAL_FALLBACK_MODEL
+        value: gemini-2.5-flash-lite
+      - key: GEMINI_ASK_RESPONSE_MODEL
+        value: gemini-2.5-flash
+      - key: GEMINI_ASK_FALLBACK_MODEL
+        value: gemini-2.5-flash-lite
+      - key: GEMINI_QUIZ_RESPONSE_MODEL
+        value: gemini-2.5-pro
+      - key: GEMINI_QUIZ_FALLBACK_MODEL
+        value: gemini-2.5-flash
+      - key: GEMINI_SUMMARY_RESPONSE_MODEL
+        value: gemini-2.5-pro
+      - key: GEMINI_SUMMARY_FALLBACK_MODEL
+        value: gemini-2.5-flash
+      - key: GEMINI_FINAL_RESPONSE_MODEL
+        value: gemini-2.5-flash
+      - key: EVAL_LLM_JUDGE_MODEL
+        value: gemini-2.5-flash
+      # ── Image / Handwritten ───────────────────────────────────────────────
+      - key: HANDWRITTEN_FLASH_MODEL
+        value: gemini-2.5-flash
+      - key: HANDWRITTEN_PRO_MODEL
+        value: gemini-2.5-pro
+      - key: IMAGE_GEMINI_OCR_MODEL
+        value: gemini-2.5-flash
+      - key: IMAGE_GEMINI_TEXT_MODEL
+        value: gemini-2.5-flash
+      - key: IMAGE_GEMINI_ENRICH_MODEL
+        value: gemini-2.5-flash
+      - key: IMAGE_GEMINI_FALLBACK_MODEL
+        value: gemini-2.5-flash-lite
+      - key: IMAGE_GEMINI_RETRIES
+        value: 3
+      - key: IMAGE_GEMINI_RETRY_SLEEP_SECONDS
+        value: 2
+      - key: IMAGE_LOW_CONFIDENCE_THRESHOLD
+        value: 60
+      - key: ENABLE_IMAGE_SUMMARIES
+        value: true
+      # ── Queue namespaces ──────────────────────────────────────────────────
+      - key: IMAGE_CHUNKING_NAMESPACE
+        value: image-chunks
+      - key: DOCUMENT_CHUNKING_NAMESPACE
+        value: document-chunks
+      - key: QNA_CHUNKING_NAMESPACE
+        value: qna-chunks
+      - key: AUDIO_CHUNKING_NAMESPACE
+        value: audio-chunks
+      - key: YOUTUBE_CHUNKING_NAMESPACE
+        value: youtube-chunks
+      - key: HANDWRITTEN_CHUNKING_NAMESPACE
+        value: handwritten-chunks
+      - key: AUDIO_CHUNKING_QUEUE
+        value: audio-chunking
+      # ── Retrieval ─────────────────────────────────────────────────────────
+      - key: RETRIEVAL_DEFAULT_TOP_K
+        value: 8
+      - key: RETRIEVAL_FINAL_MAX_OUTPUT_TOKENS
+        value: 4096
+      - key: RETRIEVAL_CACHE_ENABLED
+        value: true
+      - key: RETRIEVAL_CACHE_TTL_SECONDS
+        value: 86400
+      - key: RETRIEVAL_CACHE_HIT_THRESHOLD
+        value: 0.90
+      - key: RETRIEVAL_CACHE_MAX_ENTRIES
+        value: 200
+      # ── Rate Limiting ─────────────────────────────────────────────────────
+      - key: RATE_LIMIT_ENABLED
+        value: true
+      - key: RATE_LIMIT_STUDENT_TOKENS_PER_MIN
+        value: 50000
+      - key: RATE_LIMIT_TEACHER_TOKENS_PER_MIN
+        value: 150000
+      - key: RATE_LIMIT_STUDENT_BUCKET_CAPACITY
+        value: 80000
+      - key: RATE_LIMIT_TEACHER_BUCKET_CAPACITY
+        value: 250000
+      - key: RATE_LIMIT_STUDENT_BUCKET_REFILL
+        value: 800.0
+      - key: RATE_LIMIT_TEACHER_BUCKET_REFILL
+        value: 2500.0
+      - key: RATE_LIMIT_STUDENT_TOKENS_DAILY
+        value: 500000
+      - key: RATE_LIMIT_TEACHER_TOKENS_DAILY
+        value: 2000000
+      # ── Document / PDF ────────────────────────────────────────────────────
+      - key: DOCUMENT_PDF_STRATEGY
+        value: hi_res
+      - key: CHUNK_OVERLAP
+        value: 200
+      - key: PDF_USE_HI_RES_FOR_IMAGES
+        value: false
+
+  # ── 2. RQ Worker — ALL 6 queues in ONE container ────────────────────────────
+  # Same Docker image as the API. Only the start command differs.
+  # dockerCommand overrides the Dockerfile's CMD instruction.
+  - type: worker
+    name: coursegpt-worker
+    runtime: docker
+    dockerfilePath: apps/api/Dockerfile   # <── same image as the API
+    dockerContext: .                       # monorepo root
+    dockerCommand: python -m apps.worker.run_all_workers
+    plan: starter
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: coursegpt-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: coursegpt-redis
+          property: connectionString
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: PINECONE_ENVIRONMENT
+        value: us-east-1
+      - key: PINECONE_CLOUD
+        value: aws
+      - key: PINECONE_COURSE_INDEX_PREFIX
+        value: course
+      - key: GEMINI_EMBEDDING_MODEL
+        value: gemini-embedding-2
+      - key: GEMINI_EMBEDDING_DIM
+        value: 1536
+      - key: EMBEDDING_CONCURRENCY
+        value: 10
+      - key: ENABLE_IMAGE_SUMMARIES
+        value: true
+      - key: HANDWRITTEN_FLASH_MODEL
+        value: gemini-2.5-flash
+      - key: HANDWRITTEN_PRO_MODEL
+        value: gemini-2.5-pro
+      - key: IMAGE_GEMINI_OCR_MODEL
+        value: gemini-2.5-flash
+      - key: IMAGE_GEMINI_FALLBACK_MODEL
+        value: gemini-2.5-flash-lite
+      - key: IMAGE_CHUNKING_NAMESPACE
+        value: image-chunks
+      - key: DOCUMENT_CHUNKING_NAMESPACE
+        value: document-chunks
+      - key: QNA_CHUNKING_NAMESPACE
+        value: qna-chunks
+      - key: AUDIO_CHUNKING_NAMESPACE
+        value: audio-chunks
+      - key: YOUTUBE_CHUNKING_NAMESPACE
+        value: youtube-chunks
+      - key: HANDWRITTEN_CHUNKING_NAMESPACE
+        value: handwritten-chunks
+      - key: AUDIO_CHUNKING_QUEUE
+        value: audio-chunking
+
+  # ── 3. Next.js Frontend — Node runtime, no Docker needed ───────────────────
+  - type: web
+    name: coursegpt-web
+    runtime: node
+    rootDir: apps/web
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    plan: starter
+    envVars:
+      # Update this to the actual coursegpt-api URL after first deploy
+      - key: NEXT_PUBLIC_API_URL
+        value: https://coursegpt-api.onrender.com
+      - key: NODE_VERSION
+        value: 20
+
+databases:
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  - name: coursegpt-db
+    databaseName: coursegpt
+    user: coursegpt
+    plan: starter
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  - name: coursegpt-redis
+    plan: starter
+    maxmemoryPolicy: noeviction   # RQ requires this — never evict job keys
